@@ -461,6 +461,25 @@ Self-hosted runners for Windows require Bash shell to be installed. Easiest way 
 Git for Windows, which comes with Git BASH. Make sure that the location of `bash.exe` is part of the `PATH`
 environment variable seen by the self-hosted runner.
 
+*if you are getting error: `FileNotFoundError: [Errno 2] No such file or directory: '/github/workflow/event.json'` try to find the file event.json and copy it before running this action. for example:
+```yaml
+- name: pre-Publish test results
+  run: |
+    if [ ! -f "/github/workflow/event.json" ]; then
+        {
+          ln -sf /__w/_temp/_github_workflow/event.json /github/workflow/event.json
+        } || {
+          find / -regex '.*github.*event.json' -exec ln -sf "{}" /github/workflow/event.json \;
+        }
+    fi
+- name: Publish test results
+  uses: jadeib/publish-unit-test-result-action/composite@master
+  if: always()
+  with:
+    files: ${{ env.artifact_path }}/nosetests.xml # Path to test results
+```
+
+
 ### Isolating composite action from your workflow
 
 Note that the composite action modifies this Python environment by installing dependency packages.
