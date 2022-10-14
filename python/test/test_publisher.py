@@ -1,19 +1,53 @@
+import dataclasses
+import json
 import os
+import pathlib
+import sys
 import tempfile
 import unittest
 from collections.abc import Collection
 from datetime import datetime, timezone
+from typing import Optional, List, Mapping, Union, Any, Callable
 
 import github.CheckRun
 import mock
 from github import Github, GithubException
 
-from publish import *
+from publish import comment_mode_off, comment_mode_always, \
+    comment_mode_changes, comment_mode_changes_failures, comment_mode_changes_errors, \
+    comment_mode_failures, comment_mode_errors, Annotation, default_annotations, \
+    get_error_annotation, digest_header, get_digest_from_stats, \
+    all_tests_list, skipped_tests_list, none_list, \
+    all_tests_label_md, skipped_tests_label_md, failed_tests_label_md, passed_tests_label_md, test_errors_label_md, \
+    duration_label_md, pull_request_build_mode_merge, punctuation_space, \
+    get_long_summary_with_digest_md
 from publish.github_action import GithubAction
 from publish.publisher import Publisher, Settings, PublishData
-from publish.unittestresults import UnitTestCase, ParseError
+from publish.unittestresults import UnitTestCase, ParseError, UnitTestRunResults, UnitTestRunDeltaResults, \
+    UnitTestCaseResults
 
-errors = [ParseError('file', 'error', 1, 2)]
+sys.path.append(str(pathlib.Path(__file__).resolve().parent))
+
+from test_unittestresults import create_unit_test_run_results
+
+
+errors = [ParseError('file', 'error', 1, 2, exception=ValueError("Invalid value"))]
+
+
+@dataclasses.dataclass(frozen=True)
+class CommentConditionTest:
+    earlier_is_none: bool
+    earlier_is_different: bool
+    earlier_is_different_in_failures: bool
+    earlier_is_different_in_errors: bool
+    earlier_has_failures: bool
+    earlier_has_errors: bool
+    # current_has_changes being None indicates it is not a UnitTestRunDeltaResults but UnitTestRunResults
+    current_has_changes: Optional[bool]
+    current_has_failure_changes: bool
+    current_has_error_changes: bool
+    current_has_failures: bool
+    current_has_errors: bool
 
 
 class TestPublisher(unittest.TestCase):
@@ -43,15 +77,16 @@ class TestPublisher(unittest.TestCase):
         return pr
 
     @staticmethod
-    def create_settings(comment_mode=comment_mode_create,
+    def create_settings(comment_mode=comment_mode_always,
+                        job_summary=True,
                         compare_earlier=True,
-                        hide_comment_mode=hide_comments_mode_off,
                         report_individual_runs=False,
                         dedup_classes_by_file_name=False,
                         check_run_annotation=default_annotations,
                         event: Optional[dict] = {'before': 'before'},
                         event_name: str = 'event name',
                         json_file: Optional[str] = None,
+                        json_thousands_separator: str = punctuation_space,
                         pull_request_build: str = pull_request_build_mode_merge,
                         test_changes_limit: Optional[int] = 5):
         return Settings(
@@ -65,17 +100,21 @@ class TestPublisher(unittest.TestCase):
             repo='owner/repo',
             commit='commit',
             json_file=json_file,
+            json_thousands_separator=json_thousands_separator,
             fail_on_errors=True,
             fail_on_failures=True,
-            files_glob='*.xml',
+            junit_files_glob='*.xml',
+            nunit_files_glob=None,
+            xunit_files_glob=None,
+            trx_files_glob=None,
             time_factor=1.0,
             check_name='Check Name',
             comment_title='Comment Title',
             comment_mode=comment_mode,
+            job_summary=job_summary,
             compare_earlier=compare_earlier,
             pull_request_build=pull_request_build,
             test_changes_limit=test_changes_limit,
-            hide_comment_mode=hide_comment_mode,
             report_individual_runs=report_individual_runs,
             dedup_classes_by_file_name=dedup_classes_by_file_name,
             ignore_runs=False,
@@ -118,10 +157,7 @@ class TestPublisher(unittest.TestCase):
 
         # have repo.create_check_run return the arguments given to it
         def create_check_run_hook(**kwargs) -> Mapping[str, Any]:
-            m = mock.MagicMock()
-            m.html_url = 'mock url'
-            m.create_check_run_kwargs = kwargs
-            return m
+            return mock.MagicMock(html_url='mock url', create_check_run_kwargs=kwargs)
 
         repo.create_check_run = mock.Mock(side_effect=create_check_run_hook)
 
@@ -131,8 +167,7 @@ class TestPublisher(unittest.TestCase):
                 for check_name in check_names:
                     run = mock.MagicMock()
                     run.name = check_name
-                    check_run_output = mock.MagicMock()
-                    check_run_output.summary = 'summary\n{}{}'.format(digest_header, digest)
+                    check_run_output = mock.MagicMock(summary='summary\n{}{}'.format(digest_header, digest))
                     run.output = check_run_output
                     runs.append(run)
 
@@ -235,7 +270,7 @@ class TestPublisher(unittest.TestCase):
         publisher = mock.MagicMock(Publisher)
         publisher._settings = settings
         publisher.get_pulls = mock.Mock(return_value=prs)
-        publisher.publish_check = mock.Mock(return_value=cr)
+        publisher.publish_check = mock.Mock(return_value=(cr, None))
         Publisher.publish(publisher, stats, cases, 'success')
 
         # return calls to mocked instance, except call to _logger
@@ -282,18 +317,114 @@ class TestPublisher(unittest.TestCase):
             Annotation(path='.github', start_line=0, end_line=0, start_column=None, end_column=None, annotation_level='notice', message='There are 3 tests, see "Raw output" for the list of tests 3 to 3.', title='3 tests found (test 3 to 3)', raw_details='class ‑ test \\U0001d484')
         ], annotations)
 
+    def do_test_require_comment(self, comment_mode, test_expectation: Callable[["CommentConditionTest"], bool]):
+        tests = [(test, test_expectation(test)) for test in self.comment_condition_tests]
+
+        publisher = mock.MagicMock(Publisher)
+        publisher._settings = self.create_settings(comment_mode=comment_mode)
+
+        for test, expected in tests:
+            with self.subTest(test):
+                earlier = mock.MagicMock(
+                    is_different=mock.Mock(return_value=test.earlier_is_different),
+                    is_different_in_failures=mock.Mock(return_value=test.earlier_is_different_in_failures),
+                    is_different_in_errors=mock.Mock(return_value=test.earlier_is_different_in_errors),
+                    has_failures=test.earlier_has_failures,
+                    has_errors=test.earlier_has_errors
+                ) if not test.earlier_is_none else None
+                current = mock.MagicMock(
+                    is_delta=test.current_has_changes is not None,
+                    has_changes=test.current_has_changes,
+                    has_failure_changes=test.current_has_failure_changes,
+                    has_error_changes=test.current_has_error_changes,
+                    has_failures=test.current_has_failures,
+                    has_errors=test.current_has_errors)
+                if current.is_delta:
+                    current.without_delta = mock.Mock(return_value=current)
+                required = Publisher.require_comment(publisher, current, earlier)
+                self.assertEqual(required, expected)
+
+    comment_condition_tests = [CommentConditionTest(earlier_is_none,
+                                                    earlier_is_different, earlier_is_different_in_failures, earlier_is_different_in_errors,
+                                                    earlier_has_failures, earlier_has_errors,
+                                                    current_has_changes, current_has_failure_changes, current_has_error_changes,
+                                                    current_has_failures, current_has_errors)
+                               for earlier_is_none in [False, True]
+                               for earlier_is_different in [False, True]
+                               for earlier_is_different_in_failures in ([False, True] if not earlier_is_different else [True])
+                               for earlier_is_different_in_errors in ([False, True] if not earlier_is_different else [True])
+                               for earlier_has_failures in [False, True]
+                               for earlier_has_errors in [False, True]
+
+                               for current_has_changes in [None, False, True]
+                               for current_has_failure_changes in ([False, True] if not current_has_changes else [True])
+                               for current_has_error_changes in ([False, True] if not current_has_changes else [True])
+                               for current_has_failures in [False, True]
+                               for current_has_errors in [False, True]]
+
+    def test_require_comment_off(self):
+        self.do_test_require_comment(
+            comment_mode_off,
+            lambda _: False
+        )
+
+    def test_require_comment_always(self):
+        self.do_test_require_comment(
+            comment_mode_always,
+            lambda _: True
+        )
+
+    def test_require_comment_changes(self):
+        self.do_test_require_comment(
+            comment_mode_changes,
+            lambda test: not test.earlier_is_none and test.earlier_is_different or
+                         test.current_has_changes is None or test.current_has_changes
+        )
+
+    def test_require_comment_changes_failures(self):
+        self.do_test_require_comment(
+            comment_mode_changes_failures,
+            lambda test: not test.earlier_is_none and (test.earlier_is_different_in_failures or test.earlier_is_different_in_errors) or
+                         test.current_has_changes is None or test.current_has_failure_changes or test.current_has_error_changes
+        )
+
+    def test_require_comment_changes_errors(self):
+        self.do_test_require_comment(
+            comment_mode_changes_errors,
+            lambda test: not test.earlier_is_none and test.earlier_is_different_in_errors or
+                         test.current_has_changes is None or test.current_has_error_changes
+        )
+
+    def test_require_comment_failures(self):
+        self.do_test_require_comment(
+            comment_mode_failures,
+            lambda test: not test.earlier_is_none and (test.earlier_has_failures or test.earlier_has_errors) or
+                         (test.current_has_failures or test.current_has_errors)
+        )
+
+    def test_require_comment_errors(self):
+        self.do_test_require_comment(
+            comment_mode_errors,
+            lambda test: not test.earlier_is_none and test.earlier_has_errors or test.current_has_errors
+        )
+
     def test_publish_without_comment(self):
-        settings = self.create_settings(comment_mode=comment_mode_off, hide_comment_mode=hide_comments_mode_off)
+        settings = self.create_settings(comment_mode=comment_mode_off)
         mock_calls = self.call_mocked_publish(settings, prs=[object()])
 
-        self.assertEqual(1, len(mock_calls))
+        self.assertEqual(2, len(mock_calls))
         (method, args, kwargs) = mock_calls[0]
         self.assertEqual('publish_check', method)
         self.assertEqual((self.stats, self.cases, 'success'), args)
         self.assertEqual({}, kwargs)
 
-    def test_publish_without_comment_with_hiding(self):
-        settings = self.create_settings(comment_mode=comment_mode_off, hide_comment_mode=hide_comments_mode_all_but_latest)
+        (method, args, kwargs) = mock_calls[1]
+        self.assertEqual('publish_job_summary', method)
+        self.assertEqual((settings.comment_title, self.stats, None, None), args)
+        self.assertEqual({}, kwargs)
+
+    def test_publish_without_job_summary_and_comment(self):
+        settings = self.create_settings(comment_mode=comment_mode_off, job_summary=False)
         mock_calls = self.call_mocked_publish(settings, prs=[object()])
 
         self.assertEqual(1, len(mock_calls))
@@ -303,26 +434,8 @@ class TestPublisher(unittest.TestCase):
         self.assertEqual({}, kwargs)
 
     def test_publish_with_comment_without_pr(self):
-        settings = self.create_settings(comment_mode=comment_mode_create, hide_comment_mode=hide_comments_mode_off)
+        settings = self.create_settings()
         mock_calls = self.call_mocked_publish(settings, prs=[])
-
-        self.assertEqual(2, len(mock_calls))
-
-        (method, args, kwargs) = mock_calls[0]
-        self.assertEqual('publish_check', method)
-        self.assertEqual((self.stats, self.cases, 'success'), args)
-        self.assertEqual({}, kwargs)
-
-        (method, args, kwargs) = mock_calls[1]
-        self.assertEqual('get_pulls', method)
-        self.assertEqual((settings.commit, ), args)
-        self.assertEqual({}, kwargs)
-
-    def test_publish_with_comment_without_hiding(self):
-        pr = object()
-        cr = object()
-        settings = self.create_settings(comment_mode=comment_mode_create, hide_comment_mode=hide_comments_mode_off)
-        mock_calls = self.call_mocked_publish(settings, prs=[pr], cr=cr)
 
         self.assertEqual(3, len(mock_calls))
 
@@ -332,59 +445,19 @@ class TestPublisher(unittest.TestCase):
         self.assertEqual({}, kwargs)
 
         (method, args, kwargs) = mock_calls[1]
-        self.assertEqual('get_pulls', method)
-        self.assertEqual((settings.commit, ), args)
+        self.assertEqual('publish_job_summary', method)
+        self.assertEqual((settings.comment_title, self.stats, None, None), args)
         self.assertEqual({}, kwargs)
 
         (method, args, kwargs) = mock_calls[2]
-        self.assertEqual('publish_comment', method)
-        self.assertEqual((settings.comment_title, self.stats, pr, cr, self.cases), args)
-        self.assertEqual({}, kwargs)
-
-    def do_test_publish_with_comment_with_hide(self, hide_mode: str, hide_method: str):
-        pr = object()
-        cr = object()
-        settings = self.create_settings(comment_mode=comment_mode_create, hide_comment_mode=hide_mode)
-        mock_calls = self.call_mocked_publish(settings, prs=[pr], cr=cr)
-
-        self.assertEqual(4, len(mock_calls))
-
-        (method, args, kwargs) = mock_calls[0]
-        self.assertEqual('publish_check', method)
-        self.assertEqual((self.stats, self.cases, 'success'), args)
-        self.assertEqual({}, kwargs)
-
-        (method, args, kwargs) = mock_calls[1]
         self.assertEqual('get_pulls', method)
         self.assertEqual((settings.commit, ), args)
         self.assertEqual({}, kwargs)
-
-        (method, args, kwargs) = mock_calls[2]
-        self.assertEqual('publish_comment', method)
-        self.assertEqual((settings.comment_title, self.stats, pr, cr, self.cases), args)
-        self.assertEqual({}, kwargs)
-
-        (method, args, kwargs) = mock_calls[3]
-        self.assertEqual(hide_method, method)
-        self.assertEqual((pr, ), args)
-        self.assertEqual({}, kwargs)
-
-    def test_publish_with_comment_hide_all_but_latest(self):
-        self.do_test_publish_with_comment_with_hide(
-            hide_comments_mode_all_but_latest,
-            'hide_all_but_latest_comments'
-        )
-
-    def test_publish_with_comment_hide_orphaned(self):
-        self.do_test_publish_with_comment_with_hide(
-            hide_comments_mode_orphaned,
-            'hide_orphaned_commit_comments'
-        )
 
     def test_publish_without_compare(self):
         pr = object()
         cr = object()
-        settings = self.create_settings(comment_mode=comment_mode_create, hide_comment_mode=hide_comments_mode_all_but_latest, compare_earlier=False)
+        settings = self.create_settings(compare_earlier=False)
         mock_calls = self.call_mocked_publish(settings, prs=[pr], cr=cr)
 
         self.assertEqual(4, len(mock_calls))
@@ -395,28 +468,28 @@ class TestPublisher(unittest.TestCase):
         self.assertEqual({}, kwargs)
 
         (method, args, kwargs) = mock_calls[1]
+        self.assertEqual('publish_job_summary', method)
+        self.assertEqual((settings.comment_title, self.stats, cr, None), args)
+        self.assertEqual({}, kwargs)
+
+        (method, args, kwargs) = mock_calls[2]
         self.assertEqual('get_pulls', method)
         self.assertEqual((settings.commit, ), args)
         self.assertEqual({}, kwargs)
 
-        (method, args, kwargs) = mock_calls[2]
+        (method, args, kwargs) = mock_calls[3]
         self.assertEqual('publish_comment', method)
         self.assertEqual((settings.comment_title, self.stats, pr, cr, self.cases), args)
         self.assertEqual({}, kwargs)
 
-        (method, args, kwargs) = mock_calls[3]
-        self.assertEqual('hide_all_but_latest_comments', method)
-        self.assertEqual((pr, ), args)
-        self.assertEqual({}, kwargs)
-
     def test_publish_comment_compare_earlier(self):
-        pr = mock.MagicMock()
+        pr = mock.MagicMock(number="1234", create_issue_comment=mock.Mock(return_value=mock.MagicMock()))
         cr = mock.MagicMock()
         bcr = mock.MagicMock()
-        bs = mock.MagicMock()
+        bs = UnitTestRunResults(1, [], 1, 1, 3, 1, 2, 0, 0, 3, 1, 2, 0, 0, 'commit')
         stats = self.stats
         cases = UnitTestCaseResults(self.cases)
-        settings = self.create_settings(comment_mode=comment_mode_create, compare_earlier=True)
+        settings = self.create_settings(compare_earlier=True)
         publisher = mock.MagicMock(Publisher)
         publisher._settings = settings
         publisher.get_check_run = mock.Mock(return_value=bcr)
@@ -424,11 +497,13 @@ class TestPublisher(unittest.TestCase):
         publisher.get_stats_delta = mock.Mock(return_value=bs)
         publisher.get_base_commit_sha = mock.Mock(return_value="base commit")
         publisher.get_test_lists_from_check_run = mock.Mock(return_value=(None, None))
-        with mock.patch('publish.publisher.get_long_summary_md', return_value='body'):
+        publisher.require_comment = mock.Mock(return_value=True)
+        publisher.get_latest_comment = mock.Mock(return_value=None)
+        with mock.patch('publish.publisher.get_long_summary_with_digest_md', return_value='body'):
             Publisher.publish_comment(publisher, 'title', stats, pr, cr, cases)
         mock_calls = publisher.mock_calls
 
-        self.assertEqual(4, len(mock_calls))
+        self.assertEqual(6, len(mock_calls))
 
         (method, args, kwargs) = mock_calls[0]
         self.assertEqual('get_base_commit_sha', method)
@@ -450,28 +525,23 @@ class TestPublisher(unittest.TestCase):
         self.assertEqual((bcr, ), args)
         self.assertEqual({}, kwargs)
 
+        (method, args, kwargs) = mock_calls[4]
+        self.assertEqual('get_latest_comment', method)
+
+        (method, args, kwargs) = mock_calls[5]
+        self.assertEqual('require_comment', method)
+
         mock_calls = pr.mock_calls
-        self.assertEqual(3, len(mock_calls))
+        self.assertEqual(1, len(mock_calls))
 
         (method, args, kwargs) = mock_calls[0]
         self.assertEqual('create_issue_comment', method)
         self.assertEqual(('## title\nbody', ), args)
         self.assertEqual({}, kwargs)
 
-        (method, args, kwargs) = mock_calls[1]
-        self.assertEqual('number.__str__', method)
-        self.assertEqual((), args)
-        self.assertEqual({}, kwargs)
-
-        (method, args, kwargs) = mock_calls[2]
-        self.assertEqual('create_issue_comment().html_url.__str__', method)
-        self.assertEqual((), args)
-        self.assertEqual({}, kwargs)
-
     def test_publish_comment_compare_earlier_with_restricted_unicode(self):
-        pr = mock.MagicMock()
-        cr = mock.MagicMock()
-        cr.html_url = 'html://url'
+        pr = mock.MagicMock(number="1234", create_issue_comment=mock.Mock(return_value=mock.MagicMock()))
+        cr = mock.MagicMock(html_url='html://url')
         bcr = mock.MagicMock()
         bs = UnitTestRunResults(1, [], 1, 1, 3, 1, 2, 0, 0, 3, 1, 2, 0, 0, 'commit')
         stats = self.stats
@@ -485,23 +555,30 @@ class TestPublisher(unittest.TestCase):
             ((None, 'class', 'test 𝒇'), {'success': [None]}),     # added test 𝒇
         ])
 
-        settings = self.create_settings(comment_mode=comment_mode_create, compare_earlier=True)
+        settings = self.create_settings(compare_earlier=True)
         publisher = mock.MagicMock(Publisher)
         publisher._settings = settings
         publisher.get_check_run = mock.Mock(return_value=bcr)
         publisher.get_stats_from_check_run = mock.Mock(return_value=bs)
         publisher.get_stats_delta = mock.Mock(return_value=bs)
         publisher.get_base_commit_sha = mock.Mock(return_value="base commit")
+        publisher.get_latest_comment = mock.Mock(return_value=None)
+        publisher.require_comment = mock.Mock(return_value=True)
         # the earlier test cases with restricted unicode as they come from the check runs API
         publisher.get_test_lists_from_check_run = mock.Mock(return_value=(
             # before, these existed: test 𝒂, test 𝒃, skipped 𝒄, skipped 𝒅
             ['class ‑ test \\U0001d482', 'class ‑ test \\U0001d483', 'class ‑ skipped \\U0001d484', 'class ‑ skipped \\U0001d485'],
             ['class ‑ skipped \\U0001d484', 'class ‑ skipped \\U0001d485']
         ))
-        Publisher.publish_comment(publisher, 'title', stats, pr, cr, cases)
+
+        # makes gzipped digest deterministic
+        with mock.patch('gzip.time.time', return_value=0):
+            Publisher.publish_comment(publisher, 'title', stats, pr, cr, cases)
+            expected_digest = f'{digest_header}{get_digest_from_stats(stats)}'
+
         mock_calls = publisher.mock_calls
 
-        self.assertEqual(4, len(mock_calls))
+        self.assertEqual(6, len(mock_calls))
 
         (method, args, kwargs) = mock_calls[0]
         self.assertEqual('get_base_commit_sha', method)
@@ -523,8 +600,14 @@ class TestPublisher(unittest.TestCase):
         self.assertEqual((bcr, ), args)
         self.assertEqual({}, kwargs)
 
+        (method, args, kwargs) = mock_calls[4]
+        self.assertEqual('get_latest_comment', method)
+
+        (method, args, kwargs) = mock_calls[5]
+        self.assertEqual('require_comment', method)
+
         mock_calls = pr.mock_calls
-        self.assertEqual(3, len(mock_calls))
+        self.assertEqual(1, len(mock_calls))
 
         (method, args, kwargs) = mock_calls[0]
         self.assertEqual('create_issue_comment', method)
@@ -570,17 +653,9 @@ class TestPublisher(unittest.TestCase):
                           '```\n'
                           'class ‑ skipped \\U0001d486\n'
                           '```\n'
-                          '</details>\n',), args)
-        self.assertEqual({}, kwargs)
-
-        (method, args, kwargs) = mock_calls[1]
-        self.assertEqual('number.__str__', method)
-        self.assertEqual((), args)
-        self.assertEqual({}, kwargs)
-
-        (method, args, kwargs) = mock_calls[2]
-        self.assertEqual('create_issue_comment().html_url.__str__', method)
-        self.assertEqual((), args)
+                          '</details>\n'
+                          '\n'
+                          f'{expected_digest}\n', ), args)
         self.assertEqual({}, kwargs)
 
     def test_publish_comment_compare_with_itself(self):
@@ -588,12 +663,13 @@ class TestPublisher(unittest.TestCase):
         cr = mock.MagicMock()
         stats = self.stats
         cases = UnitTestCaseResults(self.cases)
-        settings = self.create_settings(comment_mode=comment_mode_create, compare_earlier=True)
+        settings = self.create_settings(compare_earlier=True)
         publisher = mock.MagicMock(Publisher)
         publisher._settings = settings
         publisher.get_check_run = mock.Mock(return_value=None)
         publisher.get_base_commit_sha = mock.Mock(return_value=stats.commit)
         publisher.get_test_lists_from_check_run = mock.Mock(return_value=(None, None))
+        publisher.get_latest_comment = mock.Mock(return_value=None)
         with mock.patch('publish.publisher.get_long_summary_md', return_value='body'):
             Publisher.publish_comment(publisher, 'title', stats, pr, cr, cases)
         mock_calls = publisher.mock_calls
@@ -609,21 +685,23 @@ class TestPublisher(unittest.TestCase):
         self.assertEqual(0, len(mock_calls))
 
     def test_publish_comment_compare_with_None(self):
-        pr = mock.MagicMock()
+        pr = mock.MagicMock(number="1234", create_issue_comment=mock.Mock(return_value=mock.MagicMock()))
         cr = mock.MagicMock()
         stats = self.stats
         cases = UnitTestCaseResults(self.cases)
-        settings = self.create_settings(comment_mode=comment_mode_create, compare_earlier=True)
+        settings = self.create_settings(compare_earlier=True)
         publisher = mock.MagicMock(Publisher)
         publisher._settings = settings
         publisher.get_check_run = mock.Mock(return_value=None)
         publisher.get_base_commit_sha = mock.Mock(return_value=None)
         publisher.get_test_lists_from_check_run = mock.Mock(return_value=(None, None))
-        with mock.patch('publish.publisher.get_long_summary_md', return_value='body'):
+        publisher.get_latest_comment = mock.Mock(return_value=None)
+        publisher.require_comment = mock.Mock(return_value=True)
+        with mock.patch('publish.publisher.get_long_summary_with_digest_md', return_value='body'):
             Publisher.publish_comment(publisher, 'title', stats, pr, cr, cases)
         mock_calls = publisher.mock_calls
 
-        self.assertEqual(3, len(mock_calls))
+        self.assertEqual(5, len(mock_calls))
 
         (method, args, kwargs) = mock_calls[0]
         self.assertEqual('get_base_commit_sha', method)
@@ -640,39 +718,38 @@ class TestPublisher(unittest.TestCase):
         self.assertEqual((None, ), args)
         self.assertEqual({}, kwargs)
 
+        (method, args, kwargs) = mock_calls[3]
+        self.assertEqual('get_latest_comment', method)
+
+        (method, args, kwargs) = mock_calls[4]
+        self.assertEqual('require_comment', method)
+
         mock_calls = pr.mock_calls
-        self.assertEqual(3, len(mock_calls))
+        self.assertEqual(1, len(mock_calls))
 
         (method, args, kwargs) = mock_calls[0]
         self.assertEqual('create_issue_comment', method)
         self.assertEqual(('## title\nbody', ), args)
         self.assertEqual({}, kwargs)
 
-        (method, args, kwargs) = mock_calls[1]
-        self.assertEqual('number.__str__', method)
-        self.assertEqual((), args)
-        self.assertEqual({}, kwargs)
-
-        (method, args, kwargs) = mock_calls[2]
-        self.assertEqual('create_issue_comment().html_url.__str__', method)
-        self.assertEqual((), args)
-        self.assertEqual({}, kwargs)
-
     def do_test_publish_comment_with_reuse_comment(self, one_exists: bool):
-        pr = mock.MagicMock()
+        pr = mock.MagicMock(number="1234", create_issue_comment=mock.Mock(return_value=mock.MagicMock()))
         cr = mock.MagicMock()
+        lc = mock.MagicMock(body='latest comment') if one_exists else None
         stats = self.stats
         cases = UnitTestCaseResults(self.cases)
-        settings = self.create_settings(comment_mode=comment_mode_update, compare_earlier=False)
+        settings = self.create_settings(comment_mode=comment_mode_always, compare_earlier=False)
         publisher = mock.MagicMock(Publisher)
         publisher._settings = settings
         publisher.get_test_lists_from_check_run = mock.Mock(return_value=(None, None))
+        publisher.get_latest_comment = mock.Mock(return_value=lc)
         publisher.reuse_comment = mock.Mock(return_value=one_exists)
-        with mock.patch('publish.publisher.get_long_summary_md', return_value='body'):
+        publisher.require_comment = mock.Mock(return_value=True)
+        with mock.patch('publish.publisher.get_long_summary_with_digest_md', return_value='body'):
             Publisher.publish_comment(publisher, 'title', stats, pr, cr, cases)
         mock_calls = publisher.mock_calls
 
-        self.assertEqual(2, len(mock_calls))
+        self.assertEqual(5 if one_exists else 3, len(mock_calls))
 
         (method, args, kwargs) = mock_calls[0]
         self.assertEqual('get_test_lists_from_check_run', method)
@@ -680,27 +757,34 @@ class TestPublisher(unittest.TestCase):
         self.assertEqual({}, kwargs)
 
         (method, args, kwargs) = mock_calls[1]
-        self.assertEqual('reuse_comment', method)
-        self.assertEqual((pr, '## title\nbody'), args)
+        self.assertEqual('get_latest_comment', method)
+        self.assertEqual((pr, ), args)
         self.assertEqual({}, kwargs)
 
+        if one_exists:
+            (method, args, kwargs) = mock_calls[2]
+            self.assertEqual('get_stats_from_summary_md', method)
+            self.assertEqual(('latest comment', ), args)
+            self.assertEqual({}, kwargs)
+
+            (method, args, kwargs) = mock_calls[3]
+            self.assertEqual('require_comment', method)
+
+            (method, args, kwargs) = mock_calls[4]
+            self.assertEqual('reuse_comment', method)
+            self.assertEqual((lc, '## title\nbody'), args)
+            self.assertEqual({}, kwargs)
+        else:
+            (method, args, kwargs) = mock_calls[2]
+            self.assertEqual('require_comment', method)
+
         mock_calls = pr.mock_calls
-        self.assertEqual(0 if one_exists else 3, len(mock_calls))
+        self.assertEqual(0 if one_exists else 1, len(mock_calls))
 
         if not one_exists:
             (method, args, kwargs) = mock_calls[0]
             self.assertEqual('create_issue_comment', method)
             self.assertEqual(('## title\nbody', ), args)
-            self.assertEqual({}, kwargs)
-
-            (method, args, kwargs) = mock_calls[1]
-            self.assertEqual('number.__str__', method)
-            self.assertEqual((), args)
-            self.assertEqual({}, kwargs)
-
-            (method, args, kwargs) = mock_calls[2]
-            self.assertEqual('create_issue_comment().html_url.__str__', method)
-            self.assertEqual((), args)
             self.assertEqual({}, kwargs)
 
     def test_publish_comment_with_reuse_comment_none_existing(self):
@@ -709,57 +793,22 @@ class TestPublisher(unittest.TestCase):
     def test_publish_comment_with_reuse_comment_one_existing(self):
         self.do_test_publish_comment_with_reuse_comment(one_exists=True)
 
-    def do_test_reuse_comment(self,
-                              pull_request_comments: List[Any],
-                              action_comments: List[Mapping[str, int]],
-                              body='body',
-                              expected_body='body\n:recycle: This comment has been updated with latest results.'):
-        pr = mock.MagicMock()
+    def do_test_reuse_comment(self, earlier_body: str, expected_body: str):
         comment = mock.MagicMock()
-        pr.get_issue_comment = mock.Mock(return_value=comment)
-        settings = self.create_settings(comment_mode=comment_mode_update, compare_earlier=False)
         publisher = mock.MagicMock(Publisher)
-        publisher._settings = settings
-        publisher.get_pull_request_comments = mock.Mock(return_value=pull_request_comments)
-        publisher.get_action_comments = mock.Mock(return_value=action_comments)
-        Publisher.reuse_comment(publisher, pr, body)
+        Publisher.reuse_comment(publisher, comment, earlier_body)
 
-        mock_calls = publisher.mock_calls
-        self.assertEqual(2, len(mock_calls))
-
-        (method, args, kwargs) = mock_calls[0]
-        self.assertEqual('get_pull_request_comments', method)
-        self.assertEqual((pr, ), args)
-        self.assertEqual({'order_by_updated': True}, kwargs)
-
-        (method, args, kwargs) = mock_calls[1]
-        self.assertEqual('get_action_comments', method)
-        self.assertEqual((pull_request_comments, ), args)
-        self.assertEqual({}, kwargs)
-
-        if action_comments:
-            pr.get_issue_comment.assert_called_once_with(action_comments[-1].get('databaseId'))
-            comment.edit.assert_called_once_with(expected_body)
-
-    def test_reuse_comment_non_existing(self):
-        self.do_test_reuse_comment(pull_request_comments=[1, 2, 3], action_comments=[])
-
-    def test_reuse_comment_one_existing(self):
-        self.do_test_reuse_comment(pull_request_comments=[1, 2, 3], action_comments=[{'databaseId': 1}])
-
-    def test_reuse_comment_multiple_existing(self):
-        self.do_test_reuse_comment(pull_request_comments=[1, 2, 3], action_comments=[{'databaseId': 1}, {'databaseId': 2}, {'databaseId': 3}])
+        comment.edit.assert_called_once_with(expected_body)
+        self.assertEqual(0, len(publisher.mock_calls))
 
     def test_reuse_comment_existing_not_updated(self):
         # we do not expect the body to be extended by the recycle message
-        self.do_test_reuse_comment(pull_request_comments=[1, 2, 3], action_comments=[{'databaseId': 1}],
-                                   body='a new comment',
+        self.do_test_reuse_comment(earlier_body='a new comment',
                                    expected_body='a new comment\n:recycle: This comment has been updated with latest results.')
 
     def test_reuse_comment_existing_updated(self):
         # we do not expect the body to be extended by the recycle message
-        self.do_test_reuse_comment(pull_request_comments=[1, 2, 3], action_comments=[{'databaseId': 1}],
-                                   body='comment already updated\n:recycle: Has been updated',
+        self.do_test_reuse_comment(earlier_body='comment already updated\n:recycle: Has been updated',
                                    expected_body='comment already updated\n:recycle: Has been updated')
 
     def do_test_get_pulls(self,
@@ -906,6 +955,18 @@ class TestPublisher(unittest.TestCase):
         expected = runs[3]
         name = runs[0].name
         self.do_test_get_check_run_from_list(runs, expected)
+
+    def test_get_stats_from_summary_md(self):
+        results = create_unit_test_run_results()
+        summary = get_long_summary_with_digest_md(results, results, 'http://url')
+        actual = Publisher.get_stats_from_summary_md(summary)
+        self.assertEqual(results, actual)
+
+    def test_get_stats_from_summary_md_recycled(self):
+        summary = f'body\n\n{digest_header}H4sIAGpapmIC/1WMyw7CIBQFf6Vh7QK4FMGfMeQWEmJbDI9V479LI6DuzsxJ5iDOrzaR2wSXiaTi84ClRJN92CvSivXI5yX7vqeCWIX4iod/VsGGcMavf8LGGGILxrKfPaba7j3Ghvj0ROeWg86/NQzb5nMFIhCBgnbUzQAIVik+c6W1YU5KVPoqNF04teT1BvQuAoL9AAAA\n:recycle: This comment has been updated with latest results.'
+        actual = Publisher.get_stats_from_summary_md(summary)
+        self.assertIsNotNone(actual)
+        self.assertEqual(6, actual.tests)
 
     @staticmethod
     def mock_check_run(name: str, status: str, started_at: datetime, summary: str) -> mock.Mock:
@@ -1111,7 +1172,7 @@ class TestPublisher(unittest.TestCase):
 
         # makes gzipped digest deterministic
         with mock.patch('gzip.time.time', return_value=0):
-            check_run = publisher.publish_check(self.stats.with_errors(errors), self.cases, 'conclusion')
+            check_run, before_check_run = publisher.publish_check(self.stats.with_errors(errors), self.cases, 'conclusion')
 
         repo.get_commit.assert_not_called()
         error_annotations = [get_error_annotation(error).to_dict() for error in errors]
@@ -1146,7 +1207,7 @@ class TestPublisher(unittest.TestCase):
                            'H4sIAAAAAAAC/0WOSQqEMBBFryJZu+g4tK2XkRAVCoc0lWQl3t'
                            '3vULqr9z48alUDTb1XTaLTRPlI4YQM0EU2gdwCzIEYwjllAq2P'
                            '1sIUrxjpD1E+YjA0QXwf0TM7hqlgOC5HMP/dt/RevnK18F3THx'
-                           'FS08fz1s0zBZBc2w5zHdX73QAAAA=='.format(errors='{} errors\u2004\u2003'.format(len(errors)) if len(errors) > 0 else ''),
+                           'FS08fz1s0zBZBc2w5zHdX73QAAAA==\n'.format(errors='{} errors\u2004\u2003'.format(len(errors)) if len(errors) > 0 else ''),
                 'annotations': annotations
             }
         )
@@ -1157,18 +1218,23 @@ class TestPublisher(unittest.TestCase):
         self.assertIsInstance(check_run, mock.Mock)
         self.assertTrue(hasattr(check_run, 'create_check_run_kwargs'))
         self.assertEqual(create_check_run_kwargs, check_run.create_check_run_kwargs)
+        self.assertIsNone(before_check_run)
 
         # check the json output has been provided
         title_errors = '{} parse errors, '.format(len(errors)) if len(errors) > 0 else ''
         summary_errors = '{} errors\u2004\u2003'.format(len(errors)) if len(errors) > 0 else ''
-        gha.set_output.assert_called_once_with(
+        gha.add_to_output.assert_called_once_with(
             'json',
             '{'
             f'"title": "{title_errors}7 errors, 6 fail, 5 skipped, 4 pass in 3s", '
             f'"summary": "  1 files  {summary_errors}2 suites   3s [:stopwatch:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols \\"duration of all tests\\")\\n22 tests 4 [:heavy_check_mark:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols \\"passed tests\\") 5 [:zzz:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols \\"skipped / disabled tests\\")   6 [:x:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols \\"failed tests\\")   7 [:fire:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols \\"test errors\\")\\n38 runs  8 [:heavy_check_mark:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols \\"passed tests\\") 9 [:zzz:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols \\"skipped / disabled tests\\") 10 [:x:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols \\"failed tests\\") 11 [:fire:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols \\"test errors\\")\\n\\nResults for commit commit.\\n", '
             '"conclusion": "conclusion", '
             '"stats": {"files": 1, ' + f'"errors": {len(errors)}, ' + '"suites": 2, "duration": 3, "tests": 22, "tests_succ": 4, "tests_skip": 5, "tests_fail": 6, "tests_error": 7, "runs": 38, "runs_succ": 8, "runs_skip": 9, "runs_fail": 10, "runs_error": 11, "commit": "commit"}, '
-            f'"annotations": {len(annotations)}'
+            f'"annotations": {len(annotations)}, '
+            f'"check_url": "{check_run.html_url}", '
+            '"formatted": {'
+            '"stats": {"files": "1", ' + f'"errors": "{len(errors)}", ' + '"suites": "2", "duration": "3", "tests": "22", "tests_succ": "4", "tests_skip": "5", "tests_fail": "6", "tests_error": "7", "runs": "38", "runs_succ": "8", "runs_skip": "9", "runs_fail": "10", "runs_error": "11", "commit": "commit"}'
+            '}'
             '}'
         )
 
@@ -1186,7 +1252,7 @@ class TestPublisher(unittest.TestCase):
 
         # makes gzipped digest deterministic
         with mock.patch('gzip.time.time', return_value=0):
-            check_run = publisher.publish_check(self.stats.with_errors(errors), self.cases, 'conclusion')
+            check_run, before_check_run = publisher.publish_check(self.stats.with_errors(errors), self.cases, 'conclusion')
 
         repo.get_commit.assert_called_once_with(earlier_commit)
         error_annotations = [get_error_annotation(error).to_dict() for error in errors]
@@ -1208,7 +1274,7 @@ class TestPublisher(unittest.TestCase):
                            'H4sIAAAAAAAC/0WOSQqEMBBFryJZu+g4tK2XkRAVCoc0lWQl3t'
                            '3vULqr9z48alUDTb1XTaLTRPlI4YQM0EU2gdwCzIEYwjllAq2P'
                            '1sIUrxjpD1E+YjA0QXwf0TM7hqlgOC5HMP/dt/RevnK18F3THx'
-                           'FS08fz1s0zBZBc2w5zHdX73QAAAA=='.format(errors='{} errors\u2004\u2003'.format(len(errors)) if len(errors) > 0 else ''),
+                           'FS08fz1s0zBZBc2w5zHdX73QAAAA==\n'.format(errors='{} errors\u2004\u2003'.format(len(errors)) if len(errors) > 0 else ''),
                 'annotations': error_annotations + [
                     {'path': 'test file', 'start_line': 0, 'end_line': 0, 'annotation_level': 'warning', 'message': 'result file', 'title': '1 out of 2 runs failed: test (class)', 'raw_details': 'content'},
                     {'path': 'test file', 'start_line': 0, 'end_line': 0, 'annotation_level': 'failure', 'message': 'result file', 'title': '1 out of 2 runs with error: test2 (class)', 'raw_details': 'error content'},
@@ -1224,11 +1290,12 @@ class TestPublisher(unittest.TestCase):
         self.assertIsInstance(check_run, mock.Mock)
         self.assertTrue(hasattr(check_run, 'create_check_run_kwargs'))
         self.assertEqual(create_check_run_kwargs, check_run.create_check_run_kwargs)
+        self.assertIsInstance(before_check_run, mock.Mock)
 
         # check the json output has been provided
         title_errors = '{} parse errors, '.format(len(errors)) if len(errors) > 0 else ''
         summary_errors = '{} errors\u2004\u2003'.format(len(errors)) if len(errors) > 0 else ''
-        gha.set_output.assert_called_once_with(
+        gha.add_to_output.assert_called_once_with(
             'json',
             '{'
             f'"title": "{title_errors}7 errors, 6 fail, 5 skipped, 4 pass in 3s", '
@@ -1236,7 +1303,12 @@ class TestPublisher(unittest.TestCase):
             '"conclusion": "conclusion", '
             '"stats": {"files": 1, ' + f'"errors": {len(errors)}, ' + '"suites": 2, "duration": 3, "tests": 22, "tests_succ": 4, "tests_skip": 5, "tests_fail": 6, "tests_error": 7, "runs": 38, "runs_succ": 8, "runs_skip": 9, "runs_fail": 10, "runs_error": 11, "commit": "commit"}, '
             '"stats_with_delta": {"files": {"number": 1, "delta": 0}, ' + f'"errors": {len(errors)}, ' + '"suites": {"number": 2, "delta": 0}, "duration": {"duration": 3, "delta": 0}, "tests": {"number": 22, "delta": 1}, "tests_succ": {"number": 4, "delta": -8}, "tests_skip": {"number": 5, "delta": 1}, "tests_fail": {"number": 6, "delta": 4}, "tests_error": {"number": 7, "delta": 4}, "runs": {"number": 38, "delta": 1}, "runs_succ": {"number": 8, "delta": -17}, "runs_skip": {"number": 9, "delta": 2}, "runs_fail": {"number": 10, "delta": 6}, "runs_error": {"number": 11, "delta": 10}, "commit": "commit", "reference_type": "earlier", "reference_commit": "past"}, '
-            f'"annotations": {4 + len(errors)}'
+            f'"annotations": {4 + len(errors)}, '
+            f'"check_url": "{check_run.html_url}", '
+            '"formatted": {'
+            '"stats": {"files": "1", ' + f'"errors": "{len(errors)}", ' + '"suites": "2", "duration": "3", "tests": "22", "tests_succ": "4", "tests_skip": "5", "tests_fail": "6", "tests_error": "7", "runs": "38", "runs_succ": "8", "runs_skip": "9", "runs_fail": "10", "runs_error": "11", "commit": "commit"}, '
+            '"stats_with_delta": {"files": {"number": "1", "delta": "0"}, ' + f'"errors": "{len(errors)}", ' + '"suites": {"number": "2", "delta": "0"}, "duration": {"duration": "3", "delta": "0"}, "tests": {"number": "22", "delta": "1"}, "tests_succ": {"number": "4", "delta": "-8"}, "tests_skip": {"number": "5", "delta": "1"}, "tests_fail": {"number": "6", "delta": "4"}, "tests_error": {"number": "7", "delta": "4"}, "runs": {"number": "38", "delta": "1"}, "runs_succ": {"number": "8", "delta": "-17"}, "runs_skip": {"number": "9", "delta": "2"}, "runs_fail": {"number": "10", "delta": "6"}, "runs_error": {"number": "11", "delta": "10"}, "commit": "commit", "reference_type": "earlier", "reference_commit": "past"}'
+            '}'
             '}'
         )
 
@@ -1248,7 +1320,7 @@ class TestPublisher(unittest.TestCase):
 
         # makes gzipped digest deterministic
         with mock.patch('gzip.time.time', return_value=0):
-            check_run = publisher.publish_check(self.stats, self.cases, 'conclusion')
+            check_run, before_check_run = publisher.publish_check(self.stats, self.cases, 'conclusion')
 
         repo.get_commit.assert_not_called()
         create_check_run_kwargs = dict(
@@ -1267,7 +1339,7 @@ class TestPublisher(unittest.TestCase):
                            '[test-results]:data:application/gzip;base64,H4sIAAAAAAAC/0WOSQqEMBBFryJ'
                            'Zu+g4tK2XkRAVCoc0lWQl3t3vULqr9z48alUDTb1XTaLTRPlI4YQM0EU2gdwCzIEYwjllAq'
                            '2P1sIUrxjpD1E+YjA0QXwf0TM7hqlgOC5HMP/dt/RevnK18F3THxFS08fz1s0zBZBc2w5zH'
-                           'dX73QAAAA==',
+                           'dX73QAAAA==\n',
                 'annotations': [
                     {'path': 'test file', 'start_line': 0, 'end_line': 0, 'annotation_level': 'warning', 'message': 'result file', 'title': '1 out of 2 runs failed: test (class)', 'raw_details': 'content'},
                     {'path': 'test file', 'start_line': 0, 'end_line': 0, 'annotation_level': 'failure', 'message': 'result file', 'title': '1 out of 2 runs with error: test2 (class)', 'raw_details': 'error content'},
@@ -1283,6 +1355,7 @@ class TestPublisher(unittest.TestCase):
         self.assertIsInstance(check_run, mock.Mock)
         self.assertTrue(hasattr(check_run, 'create_check_run_kwargs'))
         self.assertEqual(create_check_run_kwargs, check_run.create_check_run_kwargs)
+        self.assertIsNone(before_check_run)
 
     def test_publish_check_with_multiple_annotation_pages(self):
         earlier_commit = 'past'
@@ -1307,7 +1380,7 @@ class TestPublisher(unittest.TestCase):
 
         # makes gzipped digest deterministic
         with mock.patch('gzip.time.time', return_value=0):
-            check_run = publisher.publish_check(self.stats, cases, 'conclusion')
+            check_run, before_check_run = publisher.publish_check(self.stats, cases, 'conclusion')
 
         repo.get_commit.assert_called_once_with(earlier_commit)
         # we expect a single call to create_check_run
@@ -1328,7 +1401,7 @@ class TestPublisher(unittest.TestCase):
                            'H4sIAAAAAAAC/0WOSQqEMBBFryJZu+g4tK2XkRAVCoc0lWQl3t'
                            '3vULqr9z48alUDTb1XTaLTRPlI4YQM0EU2gdwCzIEYwjllAq2P'
                            '1sIUrxjpD1E+YjA0QXwf0TM7hqlgOC5HMP/dt/RevnK18F3THx'
-                           'FS08fz1s0zBZBc2w5zHdX73QAAAA==',
+                           'FS08fz1s0zBZBc2w5zHdX73QAAAA==\n',
                 'annotations': ([
                     {'path': 'test file', 'start_line': i, 'end_line': i, 'annotation_level': 'warning', 'message': 'result file', 'title': f'test{i} (class) failed', 'raw_details': f'content{i}'}
                     # we expect the first 50 annotations in the create call
@@ -1343,6 +1416,7 @@ class TestPublisher(unittest.TestCase):
         self.assertIsInstance(check_run, mock.Mock)
         self.assertTrue(hasattr(check_run, 'create_check_run_kwargs'))
         self.assertEqual(create_check_run_kwargs, check_run.create_check_run_kwargs)
+        self.assertIsInstance(before_check_run, mock.Mock)
 
         # we expect the edit method of the created check to be called for the remaining annotations
         # we expect three calls, each batch starting at these starts,
@@ -1360,7 +1434,7 @@ class TestPublisher(unittest.TestCase):
                            'H4sIAAAAAAAC/0WOSQqEMBBFryJZu+g4tK2XkRAVCoc0lWQl3t'
                            '3vULqr9z48alUDTb1XTaLTRPlI4YQM0EU2gdwCzIEYwjllAq2P'
                            '1sIUrxjpD1E+YjA0QXwf0TM7hqlgOC5HMP/dt/RevnK18F3THx'
-                           'FS08fz1s0zBZBc2w5zHdX73QAAAA==',
+                           'FS08fz1s0zBZBc2w5zHdX73QAAAA==\n',
                 'annotations': ([
                     {'path': 'test file', 'start_line': i, 'end_line': i, 'annotation_level': 'warning', 'message': 'result file', 'title': f'test{i} (class) failed', 'raw_details': f'content{i}'}
                     # for each edit we expect a batch of 50 annotations starting at start
@@ -1375,78 +1449,350 @@ class TestPublisher(unittest.TestCase):
 
         self.assertEqual(check_run.edit.call_args_list, [mock.call(output=output) for output in outputs])
 
+    publish_data = PublishData(
+        title='title',
+        summary='summary',
+        conclusion='conclusion',
+        stats=UnitTestRunResults(
+            files=12345,
+            errors=[ParseError('file', 'message', 1, 2, exception=ValueError("Invalid value"))],
+            suites=2,
+            duration=3456,
+            tests=4, tests_succ=5, tests_skip=6, tests_fail=7, tests_error=8901,
+            runs=9, runs_succ=10, runs_skip=11, runs_fail=12, runs_error=1345,
+            commit='commit'
+        ),
+        stats_with_delta=UnitTestRunDeltaResults(
+            files={'number': 1234, 'delta': -1234},
+            errors=[
+                ParseError('file', 'message', 1, 2, exception=ValueError("Invalid value")),
+                ParseError('file2', 'message2', 2, 4)
+            ],
+            suites={'number': 2, 'delta': -2},
+            duration={'number': 3456, 'delta': -3456},
+            tests={'number': 4, 'delta': -4}, tests_succ={'number': 5, 'delta': -5},
+            tests_skip={'number': 6, 'delta': -6}, tests_fail={'number': 7, 'delta': -7},
+            tests_error={'number': 8, 'delta': -8},
+            runs={'number': 9, 'delta': -9}, runs_succ={'number': 10, 'delta': -10},
+            runs_skip={'number': 11, 'delta': -11}, runs_fail={'number': 12, 'delta': -12},
+            runs_error={'number': 1345, 'delta': -1345},
+            commit='commit',
+            reference_type='type', reference_commit='ref'
+        ),
+        annotations=[Annotation(
+            path='path',
+            start_line=1,
+            end_line=2,
+            start_column=3,
+            end_column=4,
+            annotation_level='failure',
+            message='message',
+            title=f'Error processing result file',
+            raw_details='file'
+        )],
+        check_url='http://check-run.url'
+    )
+
+    def test_publish_data(self):
+        for separator in ['.', ',', ' ', punctuation_space]:
+            with self.subTest(json_thousands_separator=separator):
+                self.maxDiff = None
+                self.assertEqual({
+                    'title': 'title',
+                    'summary': 'summary',
+                    'conclusion': 'conclusion',
+                    'stats': {'commit': 'commit',
+                              'duration': 3456,
+                              'errors': [{'column': 2,
+                                          'file': 'file',
+                                          'line': 1,
+                                          'message': 'message'}],
+                              'files': 12345,
+                              'runs': 9,
+                              'runs_error': 1345,
+                              'runs_fail': 12,
+                              'runs_skip': 11,
+                              'runs_succ': 10,
+                              'suites': 2,
+                              'tests': 4,
+                              'tests_error': 8901,
+                              'tests_fail': 7,
+                              'tests_skip': 6,
+                              'tests_succ': 5},
+                    'stats_with_delta': {'commit': 'commit',
+                                         'duration': {'delta': -3456, 'number': 3456},
+                                         'errors': [{'column': 2,
+                                                     'file': 'file',
+                                                     'line': 1,
+                                                     'message': 'message'},
+                                                    {'column': 4,
+                                                     'file': 'file2',
+                                                     'line': 2,
+                                                     'message': 'message2'}],
+                                         'files': {'delta': -1234, 'number': 1234},
+                                         'reference_commit': 'ref',
+                                         'reference_type': 'type',
+                                         'runs': {'delta': -9, 'number': 9},
+                                         'runs_error': {'delta': -1345, 'number': 1345},
+                                         'runs_fail': {'delta': -12, 'number': 12},
+                                         'runs_skip': {'delta': -11, 'number': 11},
+                                         'runs_succ': {'delta': -10, 'number': 10},
+                                         'suites': {'delta': -2, 'number': 2},
+                                         'tests': {'delta': -4, 'number': 4},
+                                         'tests_error': {'delta': -8, 'number': 8},
+                                         'tests_fail': {'delta': -7, 'number': 7},
+                                         'tests_skip': {'delta': -6, 'number': 6},
+                                         'tests_succ': {'delta': -5, 'number': 5}},
+                    'formatted': {'stats': {'commit': 'commit',
+                                            'duration': "3" + separator + "456",
+                                            'errors': [{'column': 2,
+                                                        'file': 'file',
+                                                        'line': 1,
+                                                        'message': 'message'}],
+                                            'files': "12" + separator + "345",
+                                            'runs': "9",
+                                            'runs_error': "1" + separator + "345",
+                                            'runs_fail': "12",
+                                            'runs_skip': "11",
+                                            'runs_succ': "10",
+                                            'suites': "2",
+                                            'tests': "4",
+                                            'tests_error': "8" + separator + "901",
+                                            'tests_fail': "7",
+                                            'tests_skip': "6",
+                                            'tests_succ': "5"},
+                                  'stats_with_delta': {'commit': 'commit',
+                                                       'duration': {'delta': "-3" + separator + "456", 'number': "3" + separator + "456"},
+                                                       'errors': [{'column': 2,
+                                                                   'file': 'file',
+                                                                   'line': 1,
+                                                                   'message': 'message'},
+                                                                  {'column': 4,
+                                                                   'file': 'file2',
+                                                                   'line': 2,
+                                                                   'message': 'message2'}],
+                                                       'files': {'delta': "-1" + separator + "234", 'number': "1" + separator + "234"},
+                                                       'reference_commit': 'ref',
+                                                       'reference_type': 'type',
+                                                       'runs': {'delta': "-9", 'number': "9"},
+                                                       'runs_error': {'delta': "-1" + separator + "345", 'number': "1" + separator + "345"},
+                                                       'runs_fail': {'delta': "-12", 'number': "12"},
+                                                       'runs_skip': {'delta': "-11", 'number': "11"},
+                                                       'runs_succ': {'delta': "-10", 'number': "10"},
+                                                       'suites': {'delta': "-2", 'number': "2"},
+                                                       'tests': {'delta': "-4", 'number': "4"},
+                                                       'tests_error': {'delta': "-8", 'number': "8"},
+                                                       'tests_fail': {'delta': "-7", 'number': "7"},
+                                                       'tests_skip': {'delta': "-6", 'number': "6"},
+                                                       'tests_succ': {'delta': "-5", 'number': "5"}}},
+                    'annotations': [{'annotation_level': 'failure',
+                                     'end_column': 4,
+                                     'end_line': 2,
+                                     'message': 'message',
+                                     'path': 'path',
+                                     'raw_details': 'file',
+                                     'start_column': 3,
+                                     'start_line': 1,
+                                     'title': 'Error processing result file'}],
+                    'check_url': 'http://check-run.url'},
+                    self.publish_data.to_dict(separator))
+
+                self.assertEqual({
+                    'title': 'title',
+                    'summary': 'summary',
+                    'conclusion': 'conclusion',
+                    'stats': {'commit': 'commit',
+                              'duration': 3456,
+                              'errors': 1,
+                              'files': 12345,
+                              'runs': 9,
+                              'runs_error': 1345,
+                              'runs_fail': 12,
+                              'runs_skip': 11,
+                              'runs_succ': 10,
+                              'suites': 2,
+                              'tests': 4,
+                              'tests_error': 8901,
+                              'tests_fail': 7,
+                              'tests_skip': 6,
+                              'tests_succ': 5},
+                    'stats_with_delta': {'commit': 'commit',
+                                         'duration': {'delta': -3456, 'number': 3456},
+                                         'errors': 2,
+                                         'files': {'delta': -1234, 'number': 1234},
+                                         'reference_commit': 'ref',
+                                         'reference_type': 'type',
+                                         'runs': {'delta': -9, 'number': 9},
+                                         'runs_error': {'delta': -1345, 'number': 1345},
+                                         'runs_fail': {'delta': -12, 'number': 12},
+                                         'runs_skip': {'delta': -11, 'number': 11},
+                                         'runs_succ': {'delta': -10, 'number': 10},
+                                         'suites': {'delta': -2, 'number': 2},
+                                         'tests': {'delta': -4, 'number': 4},
+                                         'tests_error': {'delta': -8, 'number': 8},
+                                         'tests_fail': {'delta': -7, 'number': 7},
+                                         'tests_skip': {'delta': -6, 'number': 6},
+                                         'tests_succ': {'delta': -5, 'number': 5}},
+                    'formatted': {'stats': {'commit': 'commit',
+                                            'duration': "3" + separator + "456",
+                                            'errors': "1",
+                                            'files': "12" + separator + "345",
+                                            'runs': "9",
+                                            'runs_error': "1" + separator + "345",
+                                            'runs_fail': "12",
+                                            'runs_skip': "11",
+                                            'runs_succ': "10",
+                                            'suites': "2",
+                                            'tests': "4",
+                                            'tests_error': "8" + separator + "901",
+                                            'tests_fail': "7",
+                                            'tests_skip': "6",
+                                            'tests_succ': "5"},
+                                  'stats_with_delta': {'commit': 'commit',
+                                                       'duration': {'delta': "-3" + separator + "456", 'number': "3" + separator + "456"},
+                                                       'errors': "2",
+                                                       'files': {'delta': "-1" + separator + "234", 'number': "1" + separator + "234"},
+                                                       'reference_commit': 'ref',
+                                                       'reference_type': 'type',
+                                                       'runs': {'delta': "-9", 'number': "9"},
+                                                       'runs_error': {'delta': "-1" + separator + "345", 'number': "1" + separator + "345"},
+                                                       'runs_fail': {'delta': "-12", 'number': "12"},
+                                                       'runs_skip': {'delta': "-11", 'number': "11"},
+                                                       'runs_succ': {'delta': "-10", 'number': "10"},
+                                                       'suites': {'delta': "-2", 'number': "2"},
+                                                       'tests': {'delta': "-4", 'number': "4"},
+                                                       'tests_error': {'delta': "-8", 'number': "8"},
+                                                       'tests_fail': {'delta': "-7", 'number': "7"},
+                                                       'tests_skip': {'delta': "-6", 'number': "6"},
+                                                       'tests_succ': {'delta': "-5", 'number': "5"}}},
+                    'annotations': 1,
+                    'check_url': 'http://check-run.url'},
+                    self.publish_data.to_reduced_dict(separator))
+
     def test_publish_json(self):
-        with tempfile.TemporaryDirectory() as path:
-            filepath = os.path.join(path, 'file.json')
-            settings = self.create_settings(json_file=filepath)
+        for separator in ['.', ',', ' ', punctuation_space]:
+            with self.subTest(json_thousands_separator=separator):
+                with tempfile.TemporaryDirectory() as path:
+                    filepath = os.path.join(path, 'file.json')
+                    settings = self.create_settings(json_file=filepath, json_thousands_separator=separator)
 
-            gh, gha, req, repo, commit = self.create_mocks(digest=self.base_digest, check_names=[settings.check_name])
-            publisher = Publisher(settings, gh, gha)
+                    gh, gha, req, repo, commit = self.create_mocks(digest=self.base_digest, check_names=[settings.check_name])
+                    publisher = Publisher(settings, gh, gha)
 
-            data = PublishData(
-                title='title',
-                summary='summary',
-                conclusion='conclusion',
-                stats=UnitTestRunResults(
-                    files=1,
-                    errors=[ParseError('file', 'message', 1, 2)],
-                    suites=2,
-                    duration=3,
-                    tests=4, tests_succ=5, tests_skip=6, tests_fail=7, tests_error=8,
-                    runs=9, runs_succ=10, runs_skip=11, runs_fail=12, runs_error=13,
-                    commit='commit'
-                ),
-                stats_with_delta=UnitTestRunDeltaResults(
-                    files={'number': 1, 'delta': -1},
-                    errors=[ParseError('file', 'message', 1, 2), ParseError('file2', 'message2', 2, 4)],
-                    suites={'number': 2, 'delta': -2},
-                    duration={'number': 3, 'delta': -3},
-                    tests={'number': 4, 'delta': -4}, tests_succ={'number': 5, 'delta': -5}, tests_skip={'number': 6, 'delta': -6}, tests_fail={'number': 7, 'delta': -7}, tests_error={'number': 8, 'delta': -8},
-                    runs={'number': 9, 'delta': -9}, runs_succ={'number': 10, 'delta': -10}, runs_skip={'number': 11, 'delta': -11}, runs_fail={'number': 12, 'delta': -12}, runs_error={'number': 13, 'delta': -13},
-                    commit='commit',
-                    reference_type='type', reference_commit='ref'
-                ),
-                annotations=[Annotation(
-                    path='path',
-                    start_line=1,
-                    end_line=2,
-                    start_column=3,
-                    end_column=4,
-                    annotation_level='failure',
-                    message='message',
-                    title=f'Error processing result file',
-                    raw_details='file'
-                )]
-            )
-            publisher.publish_json(data)
-            gha.error.assert_not_called()
+                    publisher.publish_json(self.publish_data)
+                    gha.error.assert_not_called()
 
-            # assert the file
-            with open(filepath, encoding='utf-8') as r:
-                actual = r.read()
-                self.assertEqual(
-                    '{'
-                    '"title": "title", '
-                    '"summary": "summary", '
-                    '"conclusion": "conclusion", '
-                    '"stats": {"files": 1, "errors": [{"file": "file", "message": "message", "line": 1, "column": 2}], "suites": 2, "duration": 3, "tests": 4, "tests_succ": 5, "tests_skip": 6, "tests_fail": 7, "tests_error": 8, "runs": 9, "runs_succ": 10, "runs_skip": 11, "runs_fail": 12, "runs_error": 13, "commit": "commit"}, '
-                    '"stats_with_delta": {"files": {"number": 1, "delta": -1}, "errors": [{"file": "file", "message": "message", "line": 1, "column": 2}, {"file": "file2", "message": "message2", "line": 2, "column": 4}], "suites": {"number": 2, "delta": -2}, "duration": {"number": 3, "delta": -3}, "tests": {"number": 4, "delta": -4}, "tests_succ": {"number": 5, "delta": -5}, "tests_skip": {"number": 6, "delta": -6}, "tests_fail": {"number": 7, "delta": -7}, "tests_error": {"number": 8, "delta": -8}, "runs": {"number": 9, "delta": -9}, "runs_succ": {"number": 10, "delta": -10}, "runs_skip": {"number": 11, "delta": -11}, "runs_fail": {"number": 12, "delta": -12}, "runs_error": {"number": 13, "delta": -13}, "commit": "commit", "reference_type": "type", "reference_commit": "ref"}, '
-                    '"annotations": [{"path": "path", "start_line": 1, "end_line": 2, "start_column": 3, "end_column": 4, "annotation_level": "failure", "message": "message", "title": "Error processing result file", "raw_details": "file"}]'
-                    '}',
-                    actual
-                )
+                    # assert the file
+                    with open(filepath, encoding='utf-8') as r:
+                        actual = r.read()
+                        self.assertEqual(
+                            '{'
+                            '"title": "title", '
+                            '"summary": "summary", '
+                            '"conclusion": "conclusion", '
+                            '"stats": {"files": 12345, "errors": [{"file": "file", "message": "message", "line": 1, "column": 2}], "suites": 2, "duration": 3456, "tests": 4, "tests_succ": 5, "tests_skip": 6, "tests_fail": 7, "tests_error": 8901, "runs": 9, "runs_succ": 10, "runs_skip": 11, "runs_fail": 12, "runs_error": 1345, "commit": "commit"}, '
+                            '"stats_with_delta": {"files": {"number": 1234, "delta": -1234}, "errors": [{"file": "file", "message": "message", "line": 1, "column": 2}, {"file": "file2", "message": "message2", "line": 2, "column": 4}], "suites": {"number": 2, "delta": -2}, "duration": {"number": 3456, "delta": -3456}, "tests": {"number": 4, "delta": -4}, "tests_succ": {"number": 5, "delta": -5}, "tests_skip": {"number": 6, "delta": -6}, "tests_fail": {"number": 7, "delta": -7}, "tests_error": {"number": 8, "delta": -8}, "runs": {"number": 9, "delta": -9}, "runs_succ": {"number": 10, "delta": -10}, "runs_skip": {"number": 11, "delta": -11}, "runs_fail": {"number": 12, "delta": -12}, "runs_error": {"number": 1345, "delta": -1345}, "commit": "commit", "reference_type": "type", "reference_commit": "ref"}, '
+                            '"annotations": [{"path": "path", "start_line": 1, "end_line": 2, "start_column": 3, "end_column": 4, "annotation_level": "failure", "message": "message", "title": "Error processing result file", "raw_details": "file"}], '
+                            '"check_url": "http://check-run.url", '
+                            '"formatted": {'
+                            '"stats": {"files": "12' + separator + '345", "errors": [{"file": "file", "message": "message", "line": 1, "column": 2}], "suites": "2", "duration": "3' + separator + '456", "tests": "4", "tests_succ": "5", "tests_skip": "6", "tests_fail": "7", "tests_error": "8' + separator + '901", "runs": "9", "runs_succ": "10", "runs_skip": "11", "runs_fail": "12", "runs_error": "1' + separator + '345", "commit": "commit"}, '
+                            '"stats_with_delta": {"files": {"number": "1' + separator + '234", "delta": "-1' + separator + '234"}, "errors": [{"file": "file", "message": "message", "line": 1, "column": 2}, {"file": "file2", "message": "message2", "line": 2, "column": 4}], "suites": {"number": "2", "delta": "-2"}, "duration": {"number": "3' + separator + '456", "delta": "-3' + separator + '456"}, "tests": {"number": "4", "delta": "-4"}, "tests_succ": {"number": "5", "delta": "-5"}, "tests_skip": {"number": "6", "delta": "-6"}, "tests_fail": {"number": "7", "delta": "-7"}, "tests_error": {"number": "8", "delta": "-8"}, "runs": {"number": "9", "delta": "-9"}, "runs_succ": {"number": "10", "delta": "-10"}, "runs_skip": {"number": "11", "delta": "-11"}, "runs_fail": {"number": "12", "delta": "-12"}, "runs_error": {"number": "1' + separator + '345", "delta": "-1' + separator + '345"}, "commit": "commit", "reference_type": "type", "reference_commit": "ref"}'
+                            '}'
+                            '}',
+                            actual
+                        )
 
-            # data is being sent to GH action output 'json'
-            # some list fields are replaced by their length
-            expected = {
-                "title": "title",
-                "summary": "summary",
-                "conclusion": "conclusion",
-                "stats": {"files": 1, "errors": 1, "suites": 2, "duration": 3, "tests": 4, "tests_succ": 5, "tests_skip": 6, "tests_fail": 7, "tests_error": 8, "runs": 9, "runs_succ": 10, "runs_skip": 11, "runs_fail": 12, "runs_error": 13, "commit": "commit"},
-                "stats_with_delta": {"files": {"number": 1, "delta": -1}, "errors": 2, "suites": {"number": 2, "delta": -2}, "duration": {"number": 3, "delta": -3}, "tests": {"number": 4, "delta": -4}, "tests_succ": {"number": 5, "delta": -5}, "tests_skip": {"number": 6, "delta": -6}, "tests_fail": {"number": 7, "delta": -7}, "tests_error": {"number": 8, "delta": -8}, "runs": {"number": 9, "delta": -9}, "runs_succ": {"number": 10, "delta": -10}, "runs_skip": {"number": 11, "delta": -11}, "runs_fail": {"number": 12, "delta": -12}, "runs_error": {"number": 13, "delta": -13}, "commit": "commit", "reference_type": "type", "reference_commit": "ref"},
-                "annotations": 1
-            }
-            gha.set_output.assert_called_once_with('json', json.dumps(expected))
+                    # data is being sent to GH action output 'json'
+                    # some list fields are replaced by their length
+                    expected = {
+                        "title": "title",
+                        "summary": "summary",
+                        "conclusion": "conclusion",
+                        "stats": {"files": 12345, "errors": 1, "suites": 2, "duration": 3456, "tests": 4, "tests_succ": 5,
+                                  "tests_skip": 6, "tests_fail": 7, "tests_error": 8901, "runs": 9, "runs_succ": 10,
+                                  "runs_skip": 11, "runs_fail": 12, "runs_error": 1345, "commit": "commit"},
+                        "stats_with_delta": {"files": {"number": 1234, "delta": -1234}, "errors": 2,
+                                             "suites": {"number": 2, "delta": -2}, "duration": {"number": 3456, "delta": -3456},
+                                             "tests": {"number": 4, "delta": -4}, "tests_succ": {"number": 5, "delta": -5},
+                                             "tests_skip": {"number": 6, "delta": -6}, "tests_fail": {"number": 7, "delta": -7},
+                                             "tests_error": {"number": 8, "delta": -8}, "runs": {"number": 9, "delta": -9},
+                                             "runs_succ": {"number": 10, "delta": -10},
+                                             "runs_skip": {"number": 11, "delta": -11},
+                                             "runs_fail": {"number": 12, "delta": -12},
+                                             "runs_error": {"number": 1345, "delta": -1345}, "commit": "commit",
+                                             "reference_type": "type", "reference_commit": "ref"},
+                        "annotations": 1,
+                        "check_url": "http://check-run.url",
+                        "formatted": {
+                            "stats": {"files": "12" + separator + "345", "errors": "1", "suites": "2", "duration": "3" + separator + "456", "tests": "4", "tests_succ": "5",
+                                      "tests_skip": "6", "tests_fail": "7", "tests_error": "8" + separator + "901", "runs": "9", "runs_succ": "10",
+                                      "runs_skip": "11", "runs_fail": "12", "runs_error": "1" + separator + "345", "commit": "commit"},
+                            "stats_with_delta": {"files": {"number": "1" + separator + "234", "delta": "-1" + separator + "234"}, "errors": "2",
+                                                 "suites": {"number": "2", "delta": "-2"}, "duration": {"number": "3" + separator + "456", "delta": "-3" + separator + "456"},
+                                                 "tests": {"number": "4", "delta": "-4"}, "tests_succ": {"number": "5", "delta": "-5"},
+                                                 "tests_skip": {"number": "6", "delta": "-6"}, "tests_fail": {"number": "7", "delta": "-7"},
+                                                 "tests_error": {"number": "8", "delta": "-8"}, "runs": {"number": "9", "delta": "-9"},
+                                                 "runs_succ": {"number": "10", "delta": "-10"},
+                                                 "runs_skip": {"number": "11", "delta": "-11"},
+                                                 "runs_fail": {"number": "12", "delta": "-12"},
+                                                 "runs_error": {"number": "1" + separator + "345", "delta": "-1" + separator + "345"}, "commit": "commit",
+                                                 "reference_type": "type", "reference_commit": "ref"}
+                        }
+                    }
+                    gha.add_to_output.assert_called_once_with('json', json.dumps(expected, ensure_ascii=False))
+
+    def test_publish_job_summary_without_before(self):
+        settings = self.create_settings(job_summary=True)
+        gh, gha, req, repo, commit = self.create_mocks(digest=self.base_digest, check_names=[settings.check_name])
+        cr = mock.MagicMock(html_url='http://check-run.url')
+        publisher = Publisher(settings, gh, gha)
+
+        publisher.publish_job_summary('title', self.stats, cr, None)
+        mock_calls = gha.mock_calls
+
+        self.assertEqual(1, len(mock_calls))
+        (method, args, kwargs) = mock_calls[0]
+        self.assertEqual('add_to_job_summary', method)
+        self.assertEqual(('## title\n'
+                          '\u205f\u20041 files\u2004\u20032 suites\u2004\u2003\u20023s [:stopwatch:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "duration of all tests")\n'
+                          '22 tests\u20034 [:heavy_check_mark:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "passed tests")\u20035 [:zzz:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "skipped / disabled tests")\u2003\u205f\u20046 [:x:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "failed tests")\u2003\u205f\u20047 [:fire:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "test errors")\n'
+                          '38 runs\u2006\u20038 [:heavy_check_mark:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "passed tests")\u20039 [:zzz:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "skipped / disabled tests")\u200310 [:x:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "failed tests")\u200311 [:fire:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "test errors")\n'
+                          '\n'
+                          'For more details on these failures and errors, see [this check](http://check-run.url).\n'
+                          '\n'
+                          'Results for commit commit.\n', ), args)
+        self.assertEqual({}, kwargs)
+
+    def test_publish_job_summary_with_before(self):
+        settings = self.create_settings(job_summary=True)
+        gh, gha, req, repo, commit = self.create_mocks(digest=self.base_digest, check_names=[settings.check_name])
+        cr = mock.MagicMock(html_url='http://check-run.url')
+        bcr = mock.MagicMock()
+        bs = UnitTestRunResults(
+            files=2, errors=[], suites=3, duration=4,
+            tests=20, tests_succ=5, tests_skip=4, tests_fail=5, tests_error=6,
+            runs=37, runs_succ=10, runs_skip=9, runs_fail=8, runs_error=7,
+            commit='before'
+        )
+        publisher = Publisher(settings, gh, gha)
+        publisher.get_check_run = mock.Mock(return_value=bcr)
+        publisher.get_stats_from_check_run = mock.Mock(return_value=bs)
+
+        publisher.publish_job_summary('title', self.stats, cr, bcr)
+        mock_calls = gha.mock_calls
+
+        self.assertEqual(1, len(mock_calls))
+        (method, args, kwargs) = mock_calls[0]
+        self.assertEqual('add_to_job_summary', method)
+        self.assertEqual(('## title\n'
+                          '\u205f\u20041 files\u2004 \u2006-\u200a1\u2002\u20032 suites\u2004 \u2006-\u200a1\u2002\u2003\u20023s [:stopwatch:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "duration of all tests") -1s\n'
+                          '22 tests +2\u2002\u20034 [:heavy_check_mark:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "passed tests") \u2006-\u200a1\u2002\u20035 [:zzz:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "skipped / disabled tests") +1\u2002\u2003\u205f\u20046 [:x:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "failed tests") +1\u2002\u2003\u205f\u20047 [:fire:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "test errors") +1\u2002\n'
+                          '38 runs\u2006 +1\u2002\u20038 [:heavy_check_mark:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "passed tests") \u2006-\u200a2\u2002\u20039 [:zzz:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "skipped / disabled tests") ±0\u2002\u200310 [:x:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "failed tests") +2\u2002\u200311 [:fire:](https://github.com/EnricoMi/publish-unit-test-result-action/blob/v1.20/README.md#the-symbols "test errors") +4\u2002\n'
+                          '\n'
+                          'For more details on these failures and errors, see [this check](http://check-run.url).\n'
+                          '\n'
+                          'Results for commit commit.\u2003± Comparison against earlier commit before.\n', ), args)
+        self.assertEqual({}, kwargs)
 
     def test_publish_comment(self):
         settings = self.create_settings(event={'pull_request': {'base': {'sha': 'commit base'}}}, event_name='pull_request')
@@ -1455,8 +1801,12 @@ class TestPublisher(unittest.TestCase):
         gh, gha, req, repo, commit = self.create_mocks(digest=self.base_digest, check_names=[settings.check_name])
         pr = self.create_github_pr(settings.repo, base_commit_sha=base_commit)
         publisher = Publisher(settings, gh, gha)
+        publisher.get_latest_comment = mock.Mock(return_value=None)
 
-        publisher.publish_comment(settings.comment_title, self.stats, pr)
+        # makes gzipped digest deterministic
+        with mock.patch('gzip.time.time', return_value=0):
+            publisher.publish_comment(settings.comment_title, self.stats, pr)
+            expected_digest = f'{digest_header}{get_digest_from_stats(self.stats)}'
 
         pr.create_issue_comment.assert_called_once_with(
             '## Comment Title\n'
@@ -1465,7 +1815,24 @@ class TestPublisher(unittest.TestCase):
             f'38 runs\u2006 +1\u2002\u20038 {passed_tests_label_md} \u2006-\u200a17\u2002\u20039 {skipped_tests_label_md} +2\u2002\u200310 {failed_tests_label_md} +6\u2002\u200311 {test_errors_label_md} +10\u2002\n'
             '\n'
             'Results for commit commit.\u2003± Comparison against base commit base.\n'
+            '\n'
+            f'{expected_digest}\n'
         )
+
+    def test_publish_comment_not_required(self):
+        # same as test_publish_comment but require_comment returns False
+        with mock.patch('publish.publisher.Publisher.require_comment', return_value=False):
+            settings = self.create_settings(event={'pull_request': {'base': {'sha': 'commit base'}}}, event_name='pull_request')
+            base_commit = 'base-commit'
+
+            gh, gha, req, repo, commit = self.create_mocks(digest=self.base_digest, check_names=[settings.check_name])
+            pr = self.create_github_pr(settings.repo, base_commit_sha=base_commit)
+            publisher = Publisher(settings, gh, gha)
+            publisher.get_latest_comment = mock.Mock(return_value=None)
+
+            publisher.publish_comment(settings.comment_title, self.stats, pr)
+
+            pr.create_issue_comment.assert_not_called()
 
     def test_publish_comment_without_base(self):
         settings = self.create_settings()
@@ -1473,11 +1840,16 @@ class TestPublisher(unittest.TestCase):
         gh, gha, req, repo, commit = self.create_mocks(digest=self.base_digest, check_names=[settings.check_name])
         pr = self.create_github_pr(settings.repo)
         publisher = Publisher(settings, gh, gha)
+        publisher.get_latest_comment = mock.Mock(return_value=None)
 
         compare = mock.MagicMock()
         compare.merge_base_commit.sha = None
         repo.compare = mock.Mock(return_value=compare)
-        publisher.publish_comment(settings.comment_title, self.stats, pr)
+
+        # makes gzipped digest deterministic
+        with mock.patch('gzip.time.time', return_value=0):
+            publisher.publish_comment(settings.comment_title, self.stats, pr)
+            expected_digest = f'{digest_header}{get_digest_from_stats(self.stats)}'
 
         pr.create_issue_comment.assert_called_once_with(
             '## Comment Title\n'
@@ -1486,6 +1858,8 @@ class TestPublisher(unittest.TestCase):
             f'38 runs\u2006\u20038 {passed_tests_label_md}\u20039 {skipped_tests_label_md}\u200310 {failed_tests_label_md}\u200311 {test_errors_label_md}\n'
             '\n'
             'Results for commit commit.\n'
+            '\n'
+            f'{expected_digest}\n'
         )
 
     def test_publish_comment_without_compare(self):
@@ -1495,8 +1869,12 @@ class TestPublisher(unittest.TestCase):
         gh, gha, req, repo, commit = self.create_mocks(digest=self.base_digest, check_names=[settings.check_name])
         pr = self.create_github_pr(settings.repo, base_commit_sha=base_commit)
         publisher = Publisher(settings, gh, gha)
+        publisher.get_latest_comment = mock.Mock(return_value=None)
 
-        publisher.publish_comment(settings.comment_title, self.stats, pr)
+        # makes gzipped digest deterministic
+        with mock.patch('gzip.time.time', return_value=0):
+            publisher.publish_comment(settings.comment_title, self.stats, pr)
+            expected_digest = f'{digest_header}{get_digest_from_stats(self.stats)}'
 
         pr.create_issue_comment.assert_called_once_with(
             '## Comment Title\n'
@@ -1505,6 +1883,8 @@ class TestPublisher(unittest.TestCase):
             f'38 runs\u2006\u20038 {passed_tests_label_md}\u20039 {skipped_tests_label_md}\u200310 {failed_tests_label_md}\u200311 {test_errors_label_md}\n'
             '\n'
             'Results for commit commit.\n'
+            '\n'
+            f'{expected_digest}\n'
         )
 
     def test_publish_comment_with_check_run_with_annotations(self):
@@ -1515,8 +1895,12 @@ class TestPublisher(unittest.TestCase):
         pr = self.create_github_pr(settings.repo, base_commit_sha=base_commit)
         cr = mock.MagicMock(html_url='http://check-run.url')
         publisher = Publisher(settings, gh, gha)
+        publisher.get_latest_comment = mock.Mock(return_value=None)
 
-        publisher.publish_comment(settings.comment_title, self.stats, pr, cr)
+        # makes gzipped digest deterministic
+        with mock.patch('gzip.time.time', return_value=0):
+            publisher.publish_comment(settings.comment_title, self.stats, pr, cr)
+            expected_digest = f'{digest_header}{get_digest_from_stats(self.stats)}'
 
         pr.create_issue_comment.assert_called_once_with(
             '## Comment Title\n'
@@ -1527,6 +1911,8 @@ class TestPublisher(unittest.TestCase):
             'For more details on these failures and errors, see [this check](http://check-run.url).\n'
             '\n'
             'Results for commit commit.\u2003± Comparison against base commit base.\n'
+            '\n'
+            f'{expected_digest}\n'
         )
 
     def test_publish_comment_with_check_run_without_annotations(self):
@@ -1537,11 +1923,16 @@ class TestPublisher(unittest.TestCase):
         pr = self.create_github_pr(settings.repo, base_commit_sha=base_commit)
         cr = mock.MagicMock(html_url='http://check-run.url')
         publisher = Publisher(settings, gh, gha)
+        publisher.get_latest_comment = mock.Mock(return_value=None)
 
         stats = dict(self.stats.to_dict())
         stats.update(tests_fail=0, tests_error=0, runs_fail=0, runs_error=0)
         stats = UnitTestRunResults.from_dict(stats)
-        publisher.publish_comment(settings.comment_title, stats, pr, cr)
+
+        # makes gzipped digest deterministic
+        with mock.patch('gzip.time.time', return_value=0):
+            publisher.publish_comment(settings.comment_title, stats, pr, cr)
+            expected_digest = f'{digest_header}{get_digest_from_stats(stats)}'
 
         pr.create_issue_comment.assert_called_once_with(
             '## Comment Title\n'
@@ -1550,6 +1941,8 @@ class TestPublisher(unittest.TestCase):
             f'38 runs\u2006 +1\u2002\u20038 {passed_tests_label_md} \u2006-\u200a17\u2002\u20039 {skipped_tests_label_md} +2\u2002\u20030 {failed_tests_label_md} \u2006-\u200a4\u2002\n'
             '\n'
             'Results for commit commit.\u2003± Comparison against base commit base.\n'
+            '\n'
+            f'{expected_digest}\n'
         )
 
     def test_get_base_commit_sha_none_event(self):
@@ -1611,8 +2004,7 @@ class TestPublisher(unittest.TestCase):
         pr.base.ref = 'master'
 
         settings = self.create_settings(event=event, event_name=event_name, pull_request_build=pull_request_build)
-        publisher = mock.MagicMock()
-        publisher._settings = settings
+        publisher = mock.MagicMock(_settings=settings)
         compare = mock.MagicMock()
         compare.merge_base_commit.sha = 'merge base commit sha'
         publisher._repo.compare = mock.Mock(return_value=compare)
@@ -1629,8 +2021,7 @@ class TestPublisher(unittest.TestCase):
             raise Exception()
 
         settings = self.create_settings(event={})
-        publisher = mock.MagicMock()
-        publisher._settings = settings
+        publisher = mock.MagicMock(_settings=settings)
         publisher._repo.compare = mock.Mock(side_effect=exception)
         result = Publisher.get_base_commit_sha(publisher, pr)
 
@@ -1767,124 +2158,3 @@ class TestPublisher(unittest.TestCase):
         actual = publisher.get_action_comments(self.comments, is_minimized=False)
 
         self.assertEqual(expected, actual)
-
-    def test_hide_comment(self):
-        settings = self.create_settings()
-        comment_node_id = 'node id'
-
-        gh, gha, req, repo, commit = self.create_mocks()
-        req.requestJsonAndCheck = mock.Mock(
-            return_value=({}, {'data': {'minimizeComment': {'minimizedComment': {'isMinimized': True}}}})
-        )
-        publisher = Publisher(settings, gh, gha)
-
-        response = publisher.hide_comment(comment_node_id)
-
-        self.assertEqual(True, response)
-        req.requestJsonAndCheck.assert_called_once_with(
-            'POST', 'https://the-github-graphql-url',
-            input={
-                'query': 'mutation MinimizeComment {'
-                '  minimizeComment(input: { subjectId: "node id", classifier: OUTDATED } ) {'
-                '    minimizedComment { isMinimized, minimizedReason }'
-                '  }'
-                '}'
-            }
-        )
-
-    hide_comments = [
-        {
-            'id': 'comment one',
-            'author': {'login': 'github-actions'},
-            'body': f'## Comment Title\n'
-                    f'\u205f\u20041 files\u2004 ±\u205f\u20040\u2002\u2003\u205f\u20041 suites\u2004 ±0\u2002\u2003\u20020s {duration_label_md} ±0s\n'
-                    f'43 {all_tests_label_md} +19\u2002\u200343 {passed_tests_label_md} +19\u2002\u20030 {skipped_tests_label_md} ±0\u2002\u20030 {failed_tests_label_md} ±0\u2002\n'
-                    f'\n'
-                    f'Results for commit dee59820.\n',
-            'isMinimized': False
-        },
-        {
-            'id': 'comment two',
-            'author': {'login': 'github-actions'},
-            'body': f'## Comment Title\n'
-                    f'\u205f\u20041 files\u2004 ±\u205f\u20040\u2002\u2003\u205f\u20041 suites\u2004 ±0\u2002\u2003\u20020s {duration_label_md} ±0s\n'
-                    f'43 {all_tests_label_md} +19\u2002\u200343 {passed_tests_label_md} +19\u2002\u20030 {skipped_tests_label_md} ±0\u2002\u20030 {failed_tests_label_md} ±0\u2002\n'
-                    f'\n'
-                    f'Results for commit 70b5dd18.\n',
-            'isMinimized': False
-        },
-        {
-            'id': 'comment three',
-            'author': {'login': 'github-actions'},
-            'body': f'## Comment Title\n'
-                    f'\u205f\u20041 files\u2004 ±\u205f\u20040\u2002\u2003\u205f\u20041 suites\u2004 ±0\u2002\u2003\u20020s {duration_label_md} ±0s\n'
-                    f'43 {all_tests_label_md} +19\u2002\u200343 {passed_tests_label_md} +19\u2002\u20030 {skipped_tests_label_md} ±0\u2002\u20030 {failed_tests_label_md} ±0\u2002\n'
-                    f'\n'
-                    f'Results for commit b469da3d.\n',
-            'isMinimized': False
-        },
-        # earlier version of comments with lower case result and comparison
-        {
-            'id': 'comment four',
-            'author': {'login': 'github-actions'},
-            'body': f'## Comment Title\n'
-                    f'\u205f\u20041 files\u2004 ±\u205f\u20040\u2002\u2003\u205f\u20041 suites\u2004 ±0\u2002\u2003\u20020s {duration_label_md} ±0s\n'
-                    f'43 {all_tests_label_md} +19\u2002\u200343 {passed_tests_label_md} +19\u2002\u20030 {skipped_tests_label_md} ±0\u2002\u20030 {failed_tests_label_md} ±0\u2002\n'
-                    f'\n'
-                    f'results for commit 52048b4\u2003± comparison against base commit 70b5dd18\n',
-            'isMinimized': False
-        }
-    ]
-
-    def test_hide_orphaned_commit_comments(self):
-        settings = self.create_settings()
-
-        pr = self.create_github_pr(settings.repo)
-        pr.get_commits = mock.Mock(return_value=[
-            mock.MagicMock(sha='dee598201650c2111b69886799514ab7eb669445'),
-            mock.MagicMock(sha='70b5dd187f73f17a3b4ac0191e22bb9eec9bbb25')
-        ])
-
-        publisher = mock.MagicMock(Publisher)
-        publisher._settings = settings
-        publisher._req = mock.MagicMock()
-        publisher._req.requestJsonAndCheck = mock.Mock(
-            return_value=({}, {'data': {'minimizeComment': {'minimizedComment': {'isMinimized': True}}}})
-        )
-        publisher.get_pull_request_comments = mock.Mock(return_value=self.hide_comments)
-        publisher.get_action_comments = mock.Mock(
-            side_effect=lambda comments: Publisher.get_action_comments(publisher, comments)
-        )
-        Publisher.hide_orphaned_commit_comments(publisher, pr)
-
-        pr.get_commits.assert_called_once_with()
-        publisher.get_pull_request_comments.assert_called_once_with(pr, order_by_updated=False)
-        publisher.get_action_comments(self.hide_comments)
-        publisher.hide_comment.assert_called_once_with('comment three')
-
-    def test_hide_all_but_latest_comments(self):
-        settings = self.create_settings()
-
-        pr = self.create_github_pr(settings.repo)
-        pr.get_commits = mock.Mock(return_value=[
-            mock.MagicMock(sha='dee598201650c2111b69886799514ab7eb669445'),
-            mock.MagicMock(sha='70b5dd187f73f17a3b4ac0191e22bb9eec9bbb25')
-        ])
-
-        publisher = mock.MagicMock(Publisher)
-        publisher._settings = settings
-        publisher._req = mock.MagicMock()
-        publisher._req.requestJsonAndCheck = mock.Mock(
-            return_value=({}, {'data': {'minimizeComment': {'minimizedComment': {'isMinimized': True}}}})
-        )
-        publisher.get_pull_request_comments = mock.Mock(return_value=self.hide_comments)
-        publisher.get_action_comments = mock.Mock(
-            side_effect=lambda comments: Publisher.get_action_comments(publisher, comments)
-        )
-        Publisher.hide_all_but_latest_comments(publisher, pr)
-
-        publisher.get_pull_request_comments.assert_called_once_with(pr, order_by_updated=False)
-        publisher.get_action_comments(self.hide_comments)
-        publisher.hide_comment.assert_has_calls(
-            [mock.call('comment one'), mock.call('comment two')], any_order=False
-        )

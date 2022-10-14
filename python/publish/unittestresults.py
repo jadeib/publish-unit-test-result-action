@@ -1,7 +1,7 @@
-from collections import defaultdict
 import dataclasses
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Optional, List, Mapping, Any, Union, Dict
+from typing import Optional, List, Mapping, Any, Union, Dict, Callable
 from xml.etree.ElementTree import ParseError as XmlParseError
 
 
@@ -29,8 +29,9 @@ class UnitTestCaseResults(defaultdict):
 class ParseError:
     file: str
     message: str
-    line: Optional[int]
-    column: Optional[int]
+    line: Optional[int] = None
+    column: Optional[int] = None
+    exception: Optional[BaseException] = None
 
     @staticmethod
     def from_exception(file: str, exception: BaseException):
@@ -44,8 +45,12 @@ class ParseError:
                 msg = f'File is not a valid XML file:\n{msg}'
             elif msg.startswith('Invalid format.'):
                 msg = f'File is not a valid JUnit file:\n{msg}'
-            return ParseError(file=file, message=msg, line=line, column=column)
-        return ParseError(file=file, message=str(exception), line=None, column=None)
+            return ParseError(file=file, message=msg, line=line, column=column, exception=exception)
+        return ParseError(file=file, message=str(exception), exception=exception)
+
+    # exceptions can be arbitrary types and might not be serializable
+    def without_exception(self) -> 'ParseError':
+        return dataclasses.replace(self, exception=None)
 
 
 @dataclass(frozen=True)
@@ -131,6 +136,7 @@ class ParsedUnitTestResultsWithCommit(ParsedUnitTestResults):
             tests_errors=self.suite_errors,
         )
 
+
 @dataclass(frozen=True)
 class UnitTestResults(ParsedUnitTestResultsWithCommit):
     cases: int
@@ -167,7 +173,47 @@ class UnitTestRunResults:
 
     commit: str
 
-    def with_errors(self, errors: List[ParseError]):
+    @property
+    def is_delta(self) -> bool:
+        return False
+
+    @property
+    def has_failures(self):
+        return self.tests_fail > 0 or self.runs_fail > 0
+
+    @property
+    def has_errors(self):
+        return len(self.errors) > 0 or self.tests_error > 0 or self.runs_error > 0
+
+    @staticmethod
+    def _change_fields(results: 'UnitTestRunResults') -> List[int]:
+        return [results.files, results.suites,
+                results.tests, results.tests_succ, results.tests_skip, results.tests_fail, results.tests_error,
+                results.runs, results.runs_succ, results.runs_skip, results.runs_fail, results.runs_error]
+
+    @staticmethod
+    def _failure_fields(results: 'UnitTestRunResults') -> List[int]:
+        return [results.tests_fail, results.runs_fail]
+
+    @staticmethod
+    def _error_fields(results: 'UnitTestRunResults') -> List[int]:
+        return [results.tests_error, results.runs_error]
+
+    def is_different(self,
+                     other: 'UnitTestRunResultsOrDeltaResults',
+                     fields_func: Callable[['UnitTestRunResults'], List[int]] = _change_fields.__func__):
+        if other.is_delta:
+            other = other.without_delta()
+
+        return any([left != right for left, right in zip(fields_func(self), fields_func(other))])
+
+    def is_different_in_failures(self, other: 'UnitTestRunResultsOrDeltaResults'):
+        return self.is_different(other, self._failure_fields)
+
+    def is_different_in_errors(self, other: 'UnitTestRunResultsOrDeltaResults'):
+        return self.is_different(other, self._error_fields)
+
+    def with_errors(self, errors: List[ParseError]) -> 'UnitTestRunResults':
         return UnitTestRunResults(
             files=self.files,
             errors=errors,
@@ -189,8 +235,32 @@ class UnitTestRunResults:
             commit=self.commit
         )
 
+    # exceptions can be arbitrary types and might not be serializable
+    def without_exceptions(self) -> 'UnitTestRunResults':
+        return UnitTestRunResults(
+            files=self.files,
+            errors=[error.without_exception() for error in self.errors],
+            suites=self.suites,
+            duration=self.duration,
+
+            tests=self.tests,
+            tests_succ=self.tests_succ,
+            tests_skip=self.tests_skip,
+            tests_fail=self.tests_fail,
+            tests_error=self.tests_error,
+
+            runs=self.runs,
+            runs_succ=self.runs_succ,
+            runs_skip=self.runs_skip,
+            runs_fail=self.runs_fail,
+            runs_error=self.runs_error,
+
+            commit=self.commit
+        )
+
     def to_dict(self) -> Dict[str, Any]:
-        return dataclasses.asdict(self)
+        # dict is usually used to serialize, but exceptions are likely not serializable, so we exclude them
+        return dataclasses.asdict(self.without_exceptions())
 
     @staticmethod
     def from_dict(values: Mapping[str, Any]) -> 'UnitTestRunResults':
@@ -243,8 +313,76 @@ class UnitTestRunDeltaResults:
     reference_type: str
     reference_commit: str
 
+    @property
+    def is_delta(self) -> bool:
+        return True
+
+    @staticmethod
+    def _has_changes(fields: List[Numeric]) -> bool:
+        return any([field.get('delta') for field in fields])
+
+    @property
+    def has_changes(self) -> bool:
+        return self._has_changes([self.files, self.suites,
+                                  self.tests, self.tests_succ, self.tests_skip, self.tests_fail, self.tests_error,
+                                  self.runs, self.runs_succ, self.runs_skip, self.runs_fail, self.runs_error])
+
+    @property
+    def has_failure_changes(self) -> bool:
+        return self._has_changes([self.tests_fail, self.runs_fail])
+
+    @property
+    def has_error_changes(self) -> bool:
+        return self._has_changes([self.tests_error, self.runs_error])
+
+    @property
+    def has_failures(self):
+        return self.tests_fail.get('number') > 0 or self.runs_fail.get('number') > 0
+
+    @property
+    def has_errors(self):
+        return len(self.errors) > 0 or self.tests_error.get('number') > 0 or self.runs_error.get('number') > 0
+
     def to_dict(self) -> Dict[str, Any]:
-        return dataclasses.asdict(self)
+        # dict is usually used to serialize, but exceptions are likely not serializable, so we exclude them
+        return dataclasses.asdict(self.without_exceptions())
+
+    def without_delta(self) -> UnitTestRunResults:
+        def v(value: Numeric) -> int:
+            return value['number']
+
+        def d(value: Numeric) -> int:
+            return value['duration']
+
+        return UnitTestRunResults(files=v(self.files), errors=self.errors, suites=v(self.suites), duration=d(self.duration),
+                                  tests=v(self.tests), tests_succ=v(self.tests_succ), tests_skip=v(self.tests_skip), tests_fail=v(self.tests_fail), tests_error=v(self.tests_error),
+                                  runs=v(self.runs), runs_succ=v(self.runs_succ), runs_skip=v(self.runs_skip), runs_fail=v(self.runs_fail), runs_error=v(self.runs_error),
+                                  commit=self.commit)
+
+    def without_exceptions(self) -> 'UnitTestRunDeltaResults':
+        return UnitTestRunDeltaResults(
+            files=self.files,
+            errors=[error.without_exception() for error in self.errors],
+            suites=self.suites,
+            duration=self.duration,
+
+            tests=self.tests,
+            tests_succ=self.tests_succ,
+            tests_skip=self.tests_skip,
+            tests_fail=self.tests_fail,
+            tests_error=self.tests_error,
+
+            runs=self.runs,
+            runs_succ=self.runs_succ,
+            runs_skip=self.runs_skip,
+            runs_fail=self.runs_fail,
+            runs_error=self.runs_error,
+
+            commit=self.commit,
+
+            reference_type=self.reference_type,
+            reference_commit=self.reference_commit
+        )
 
 
 UnitTestRunResultsOrDeltaResults = Union[UnitTestRunResults, UnitTestRunDeltaResults]

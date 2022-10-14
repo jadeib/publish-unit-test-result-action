@@ -4,15 +4,18 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import List, Any, Optional, Tuple, Mapping, Dict
+from typing import List, Set, Any, Optional, Tuple, Mapping, Dict, Union, Callable
+from copy import deepcopy
 
 from github import Github, GithubException
 from github.CheckRun import CheckRun
 from github.CheckRunAnnotation import CheckRunAnnotation
 from github.PullRequest import PullRequest
+from github.IssueComment import IssueComment
 
-from publish import hide_comments_mode_orphaned, hide_comments_mode_all_but_latest, hide_comments_mode_off, \
-    comment_mode_off, comment_mode_create, comment_mode_update, digest_prefix, restrict_unicode_list, \
+from publish import comment_mode_off, digest_prefix, restrict_unicode_list, \
+    comment_mode_always, comment_mode_changes, comment_mode_changes_failures, comment_mode_changes_errors, \
+    comment_mode_failures, comment_mode_errors, \
     get_stats_from_digest, digest_header, get_short_summary, get_long_summary_md, \
     get_long_summary_with_digest_md, get_error_annotations, get_case_annotations, \
     get_all_tests_list_annotation, get_skipped_tests_list_annotation, get_all_tests_list, \
@@ -20,7 +23,8 @@ from publish import hide_comments_mode_orphaned, hide_comments_mode_all_but_late
     Annotation, SomeTestChanges
 from publish import logger
 from publish.github_action import GithubAction
-from publish.unittestresults import UnitTestCaseResults, UnitTestRunResults, UnitTestRunDeltaResults, get_stats_delta
+from publish.unittestresults import UnitTestCaseResults, UnitTestRunResults, UnitTestRunDeltaResults, \
+    UnitTestRunResultsOrDeltaResults, get_stats_delta
 
 
 @dataclass(frozen=True)
@@ -35,17 +39,22 @@ class Settings:
     repo: str
     commit: str
     json_file: Optional[str]
+    json_thousands_separator: str
     fail_on_errors: bool
     fail_on_failures: bool
-    files_glob: str
+    # one of these *_files_glob must be set
+    junit_files_glob: Optional[str]
+    nunit_files_glob: Optional[str]
+    xunit_files_glob: Optional[str]
+    trx_files_glob: Optional[str]
     time_factor: float
     check_name: str
     comment_title: str
     comment_mode: str
+    job_summary: bool
     compare_earlier: bool
     pull_request_build: str
     test_changes_limit: int
-    hide_comment_mode: str
     report_individual_runs: bool
     dedup_classes_by_file_name: bool
     ignore_runs: bool
@@ -62,21 +71,67 @@ class PublishData:
     stats: UnitTestRunResults
     stats_with_delta: Optional[UnitTestRunDeltaResults]
     annotations: List[Annotation]
+    check_url: str
 
-    def to_dict(self) -> Mapping[str, Any]:
-        return dataclasses.asdict(self, dict_factory=lambda x: {k: v for (k, v) in x if v is not None})
+    @classmethod
+    def _format_digit(cls, value: Union[int, Mapping[str, int], Any], thousands_separator: str) -> Union[str, Mapping[str, str], Any]:
+        if isinstance(value, int):
+            return f'{value:,}'.replace(',', thousands_separator)
+        if isinstance(value, Mapping):
+            return {k: cls._format_digit(v, thousands_separator) for (k, v) in value.items()}
+        return value
 
-    def reduced(self) -> Mapping[str, Any]:
-        data = self.to_dict()
+    @classmethod
+    def _format(cls, stats: Mapping[str, Any], thousands_separator: str) -> Dict[str, Any]:
+        return {k: cls._format_digit(v, thousands_separator) for (k, v) in stats.items()}
+
+    @classmethod
+    def _formatted_stats_and_delta(cls,
+                                   stats: Optional[Mapping[str, Any]],
+                                   stats_with_delta: Optional[Mapping[str, Any]],
+                                   thousands_separator: str) -> Mapping[str, Any]:
+        d = {}
+        if stats is not None:
+            d.update(stats=cls._format(stats, thousands_separator))
+        if stats_with_delta is not None:
+            d.update(stats_with_delta=cls._format(stats_with_delta, thousands_separator))
+        return d
+
+    def _as_dict(self) -> Dict[str, Any]:
+        self_without_exceptions = dataclasses.replace(
+            self,
+            stats=self.stats.without_exceptions(),
+            stats_with_delta=self.stats_with_delta.without_exceptions() if self.stats_with_delta else None
+        )
+        # the dict_factory removes None values
+        return dataclasses.asdict(self_without_exceptions,
+                                  dict_factory=lambda x: {k: v for (k, v) in x if v is not None})
+
+    def to_dict(self, thousands_separator: str) -> Mapping[str, Any]:
+        d = self._as_dict()
+        d.update(formatted=self._formatted_stats_and_delta(
+            d.get('stats'), d.get('stats_with_delta'), thousands_separator
+        ))
+        return d
+
+    def to_reduced_dict(self, thousands_separator: str) -> Mapping[str, Any]:
+        data = self._as_dict()
 
         # replace some large fields with their lengths
-        if data.get('stats', {}).get('errors') is not None:
-            data['stats']['errors'] = len(data['stats']['errors'])
-        if data.get('stats_with_delta', {}).get('errors') is not None:
-            data['stats_with_delta']['errors'] = len(data['stats_with_delta']['errors'])
-        if data.get('annotations') is not None:
-            data['annotations'] = len(data['annotations'])
+        def reduce(d: Dict[str, Any]) -> Dict[str, Any]:
+            d = deepcopy(d)
+            if d.get('stats', {}).get('errors') is not None:
+                d['stats']['errors'] = len(d['stats']['errors'])
+            if d.get('stats_with_delta', {}).get('errors') is not None:
+                d['stats_with_delta']['errors'] = len(d['stats_with_delta']['errors'])
+            if d.get('annotations') is not None:
+                d['annotations'] = len(d['annotations'])
+            return d
 
+        data = reduce(data)
+        data.update(formatted=self._formatted_stats_and_delta(
+            data.get('stats'), data.get('stats_with_delta'), thousands_separator
+        ))
         return data
 
 
@@ -93,24 +148,21 @@ class Publisher:
                 stats: UnitTestRunResults,
                 cases: UnitTestCaseResults,
                 conclusion: str):
-        logger.info(f'publishing {conclusion} results for commit {self._settings.commit}')
-        check_run = self.publish_check(stats, cases, conclusion)
+        logger.info(f'Publishing {conclusion} results for commit {self._settings.commit}')
+        check_run, before_check_run = self.publish_check(stats, cases, conclusion)
+
+        if self._settings.job_summary:
+            self.publish_job_summary(self._settings.comment_title, stats, check_run, before_check_run)
 
         if self._settings.comment_mode != comment_mode_off:
             pulls = self.get_pulls(self._settings.commit)
             if pulls:
                 for pull in pulls:
                     self.publish_comment(self._settings.comment_title, stats, pull, check_run, cases)
-                    if self._settings.hide_comment_mode == hide_comments_mode_orphaned:
-                        self.hide_orphaned_commit_comments(pull)
-                    elif self._settings.hide_comment_mode == hide_comments_mode_all_but_latest:
-                        self.hide_all_but_latest_comments(pull)
-                if self._settings.hide_comment_mode == hide_comments_mode_off:
-                    logger.info('hide_comments disabled, not hiding any comments')
             else:
-                logger.info(f'there is no pull request for commit {self._settings.commit}')
+                logger.info(f'There is no pull request for commit {self._settings.commit}')
         else:
-            logger.info('comment_on_pr disabled, not commenting on any pull requests')
+            logger.info('Commenting on pull requests disabled')
 
     def get_pulls(self, commit: str) -> List[PullRequest]:
         # totalCount calls the GitHub API just to get the total number
@@ -218,9 +270,16 @@ class Publisher:
         for line in summary.split('\n'):
             logger.debug(f'summary: {line}')
 
-        pos = summary.index(digest_header) if digest_header in summary else None
-        if pos:
-            digest = summary[pos + len(digest_header):]
+        return Publisher.get_stats_from_summary_md(summary)
+
+    @staticmethod
+    def get_stats_from_summary_md(summary: str) -> Optional[UnitTestRunResults]:
+        start = summary.index(digest_header) if digest_header in summary else None
+        if start:
+            digest = summary[start + len(digest_header):]
+            end = digest.index('\n') if '\n' in digest else None
+            if end:
+                digest = digest[:end]
             logger.debug(f'digest: {digest}')
             stats = get_stats_from_digest(digest)
             logger.debug(f'stats: {stats}')
@@ -235,13 +294,15 @@ class Publisher:
     def publish_check(self,
                       stats: UnitTestRunResults,
                       cases: UnitTestCaseResults,
-                      conclusion: str) -> CheckRun:
+                      conclusion: str) -> Tuple[CheckRun, Optional[CheckRun]]:
         # get stats from earlier commits
         before_stats = None
+        before_check_run = None
         if self._settings.compare_earlier:
             before_commit_sha = self._settings.event.get('before')
             logger.debug(f'comparing against before={before_commit_sha}')
-            before_stats = self.get_stats_from_commit(before_commit_sha)
+            before_check_run = self.get_check_run(before_commit_sha)
+            before_stats = self.get_stats_from_check_run(before_check_run) if before_check_run is not None else None
         stats_with_delta = get_stats_delta(stats, before_stats, 'earlier') if before_stats is not None else stats
         logger.debug(f'stats with delta: {stats_with_delta}')
 
@@ -253,23 +314,12 @@ class Publisher:
         title = get_short_summary(stats)
         summary = get_long_summary_md(stats_with_delta)
 
-        # create full json
-        data = PublishData(
-            title=title,
-            summary=summary,
-            conclusion=conclusion,
-            stats=stats,
-            stats_with_delta=stats_with_delta if before_stats is not None else None,
-            annotations=all_annotations
-        )
-        self.publish_json(data)
-
         # we can send only 50 annotations at once, so we split them into chunks of 50
         check_run = None
         summary_with_digest = get_long_summary_with_digest_md(stats_with_delta, stats)
-        all_annotations = [annotation.to_dict() for annotation in all_annotations]
-        all_annotations = [all_annotations[x:x+50] for x in range(0, len(all_annotations), 50)] or [[]]
-        for annotations in all_annotations:
+        split_annotations = [annotation.to_dict() for annotation in all_annotations]
+        split_annotations = [split_annotations[x:x+50] for x in range(0, len(split_annotations), 50)] or [[]]
+        for annotations in split_annotations:
             output = dict(
                 title=title,
                 summary=summary_with_digest,
@@ -283,18 +333,31 @@ class Publisher:
                                                         status='completed',
                                                         conclusion=conclusion,
                                                         output=output)
-                logger.info(f'created check {check_run.html_url}')
+                logger.info(f'Created check {check_run.html_url}')
             else:
                 logger.debug(f'updating check with {len(annotations)} more annotations')
                 check_run.edit(output=output)
                 logger.debug(f'updated check')
-        return check_run
+
+        # create full json
+        data = PublishData(
+            title=title,
+            summary=summary,
+            conclusion=conclusion,
+            stats=stats,
+            stats_with_delta=stats_with_delta if before_stats is not None else None,
+            annotations=all_annotations,
+            check_url=check_run.html_url
+        )
+        self.publish_json(data)
+
+        return check_run, before_check_run
 
     def publish_json(self, data: PublishData):
         if self._settings.json_file:
             try:
                 with open(self._settings.json_file, 'wt', encoding='utf-8') as w:
-                    json.dump(data.to_dict(), w, ensure_ascii=False)
+                    json.dump(data.to_dict(self._settings.json_thousands_separator), w, ensure_ascii=False)
             except Exception as e:
                 self._gha.error(f'Failed to write JSON file {self._settings.json_file}: {str(e)}')
                 try:
@@ -303,7 +366,21 @@ class Publisher:
                     pass
 
         # provide a reduced version to Github actions
-        self._gha.set_output('json', json.dumps(data.reduced(), ensure_ascii=False))
+        self._gha.add_to_output('json', json.dumps(data.to_reduced_dict(self._settings.json_thousands_separator), ensure_ascii=False))
+
+    def publish_job_summary(self,
+                            title: str,
+                            stats: UnitTestRunResults,
+                            check_run: CheckRun,
+                            before_check_run: Optional[CheckRun]):
+        before_stats = self.get_stats_from_check_run(before_check_run) if before_check_run is not None else None
+        stats_with_delta = get_stats_delta(stats, before_stats, 'earlier') if before_stats is not None else stats
+
+        details_url = check_run.html_url if check_run else None
+        summary = get_long_summary_md(stats_with_delta, details_url)
+        markdown = f'## {title}\n{summary}'
+        self._gha.add_to_job_summary(markdown)
+        logger.info(f'Created job summary')
 
     @staticmethod
     def get_test_lists_from_check_run(check_run: Optional[CheckRun]) -> Tuple[Optional[List[str]], Optional[List[str]]]:
@@ -359,7 +436,7 @@ class Publisher:
                         stats: UnitTestRunResults,
                         pull_request: PullRequest,
                         check_run: Optional[CheckRun] = None,
-                        cases: Optional[UnitTestCaseResults] = None) -> PullRequest:
+                        cases: Optional[UnitTestCaseResults] = None):
         # compare them with earlier stats
         base_check_run = None
         if self._settings.compare_earlier:
@@ -382,19 +459,107 @@ class Publisher:
         all_tests, skipped_tests = restrict_unicode_list(all_tests), restrict_unicode_list(skipped_tests)
         test_changes = SomeTestChanges(before_all_tests, all_tests, before_skipped_tests, skipped_tests)
 
+        latest_comment = self.get_latest_comment(pull_request)
+        latest_comment_body = latest_comment.body if latest_comment else None
+
+        # are we required to create a comment on this PR?
+        earlier_stats = self.get_stats_from_summary_md(latest_comment_body) if latest_comment_body else None
+        if not self.require_comment(stats_with_delta, earlier_stats):
+            logger.info(f'No pull request comment required as comment mode is {self._settings.comment_mode} (comment_mode)')
+            return
+
         details_url = check_run.html_url if check_run else None
-        summary = get_long_summary_md(stats_with_delta, details_url, test_changes, self._settings.test_changes_limit)
+        summary = get_long_summary_with_digest_md(stats_with_delta, stats, details_url, test_changes, self._settings.test_changes_limit)
         body = f'## {title}\n{summary}'
 
-        # reuse existing commend when comment_mode == comment_mode_update
-        # if none exists or comment_mode != comment_mode_update, create new comment
-        if self._settings.comment_mode != comment_mode_update or not self.reuse_comment(pull_request, body):
+        # only create new comment none exists already
+        if latest_comment is None:
             comment = pull_request.create_issue_comment(body)
-            logger.info(f'created comment for pull request #{pull_request.number}: {comment.html_url}')
+            logger.info(f'Created comment for pull request #{pull_request.number}: {comment.html_url}')
+        else:
+            self.reuse_comment(latest_comment, body)
+            logger.info(f'Edited comment for pull request #{pull_request.number}: {latest_comment.html_url}')
 
-        return pull_request
+    def require_comment(self,
+                        stats: UnitTestRunResultsOrDeltaResults,
+                        earlier_stats: Optional[UnitTestRunResults]) -> bool:
+        # SomeTestChanges.has_changes cannot be used here as changes between earlier comment
+        # and current results cannot be identified
 
-    def reuse_comment(self, pull: PullRequest, body: str) -> bool:
+        if self._settings.comment_mode == comment_mode_always:
+            logger.debug(f'Comment required as comment mode is {self._settings.comment_mode}')
+            return True
+
+        # helper method to detect if changes require a comment
+        def do_changes_require_comment(earlier_stats_is_different_to: Optional[Callable[[UnitTestRunResultsOrDeltaResults], bool]],
+                                       stats_has_changes: bool,
+                                       flavour: str = '') -> bool:
+            in_flavour = ''
+            if flavour:
+                flavour = f'{flavour} '
+                in_flavour = f'in {flavour}'
+
+            if earlier_stats is not None and earlier_stats_is_different_to(stats):
+                logger.info(f'Comment required as comment mode is "{self._settings.comment_mode}" '
+                            f'and {flavour}statistics are different to earlier comment')
+                logger.debug(f'earlier: {earlier_stats}')
+                logger.debug(f'current: {stats.without_delta() if stats.is_delta else stats}')
+                return True
+            if not stats.is_delta:
+                logger.info(f'Comment required as comment mode is "{self._settings.comment_mode}" '
+                            f'but no delta statistics to target branch available')
+                return True
+            if stats_has_changes:
+                logger.info(f'Comment required as comment mode is "{self._settings.comment_mode}" '
+                            f'and changes {in_flavour} to target branch exist')
+                logger.debug(f'current: {stats}')
+                return True
+            return False
+
+        if self._settings.comment_mode == comment_mode_changes and \
+                do_changes_require_comment(earlier_stats.is_different if earlier_stats else None,
+                                           stats.has_changes):
+            return True
+
+        if self._settings.comment_mode == comment_mode_changes_failures and \
+                do_changes_require_comment(earlier_stats.is_different_in_failures if earlier_stats else None,
+                                           stats.has_failure_changes,
+                                           'failures'):
+            return True
+
+        if self._settings.comment_mode in [comment_mode_changes_failures, comment_mode_changes_errors] and \
+                do_changes_require_comment(earlier_stats.is_different_in_errors if earlier_stats else None,
+                                           stats.has_error_changes,
+                                           'errors'):
+            return True
+
+        # helper method to detect if stats require a comment
+        def do_stats_require_comment(earlier_stats_require: Optional[bool], stats_require: bool, flavour: str) -> bool:
+            if earlier_stats is not None and earlier_stats_require:
+                logger.info(f'Comment required as comment mode is {self._settings.comment_mode} '
+                            f'and {flavour} existed in earlier comment')
+                return True
+            if stats_require:
+                logger.info(f'Comment required as comment mode is {self._settings.comment_mode} '
+                            f'and {flavour} exist in current comment')
+                return True
+            return False
+
+        if self._settings.comment_mode == comment_mode_failures and \
+                do_stats_require_comment(earlier_stats.has_failures if earlier_stats else None,
+                                         stats.has_failures,
+                                         'failures'):
+            return True
+
+        if self._settings.comment_mode in [comment_mode_failures, comment_mode_errors] and \
+                do_stats_require_comment(earlier_stats.has_errors if earlier_stats else None,
+                                         stats.has_errors,
+                                         'errors'):
+            return True
+
+        return False
+
+    def get_latest_comment(self, pull: PullRequest) -> Optional[IssueComment]:
         # get comments of this pull request
         comments = self.get_pull_request_comments(pull, order_by_updated=True)
 
@@ -403,22 +568,21 @@ class Publisher:
 
         # if there is no such comment, stop here
         if len(comments) == 0:
-            return False
+            return None
 
-        # edit last comment
+        # fetch latest action comment
         comment_id = comments[-1].get("databaseId")
+        return pull.get_issue_comment(comment_id)
+
+    def reuse_comment(self, comment: IssueComment, body: str):
         if ':recycle:' not in body:
             body = f'{body}\n:recycle: This comment has been updated with latest results.'
 
         try:
-            comment = pull.get_issue_comment(comment_id)
             comment.edit(body)
-            logger.info(f'edited comment for pull request #{pull.number}: {comment.html_url}')
         except Exception as e:
-            self._gha.warning(f'Failed to edit existing comment #{comment_id}')
+            self._gha.warning(f'Failed to edit existing comment #{comment.id}')
             logger.debug('editing existing comment failed', exc_info=e)
-
-        return True
 
     def get_base_commit_sha(self, pull_request: PullRequest) -> Optional[str]:
         if self._settings.pull_request_build == pull_request_build_mode_merge:
@@ -474,75 +638,9 @@ class Publisher:
             .get('comments', {}) \
             .get('nodes')
 
-    def hide_comment(self, comment_node_id) -> bool:
-        input = dict(
-            query=r'mutation MinimizeComment {'
-                  r'  minimizeComment(input: { subjectId: "' + comment_node_id + r'", classifier: OUTDATED } ) {'
-                  r'    minimizedComment { isMinimized, minimizedReason }'
-                  r'  }'
-                  r'}'
-        )
-        headers, data = self._req.requestJsonAndCheck(
-            "POST", self._settings.graphql_url, input=input
-        )
-        return data \
-            .get('data', {}) \
-            .get('minimizeComment', {}) \
-            .get('minimizedComment', {}) \
-            .get('isMinimized', {})
-
     def get_action_comments(self, comments: List[Mapping[str, Any]], is_minimized: Optional[bool] = False):
         return list([comment for comment in comments
                      if comment.get('author', {}).get('login') == 'github-actions'
                      and (is_minimized is None or comment.get('isMinimized') == is_minimized)
                      and comment.get('body', '').startswith(f'## {self._settings.comment_title}\n')
                      and ('\nresults for commit ' in comment.get('body') or '\nResults for commit ' in comment.get('body'))])
-
-    def hide_orphaned_commit_comments(self, pull: PullRequest) -> None:
-        # rewriting history of branch removes commits
-        # we do not want to show test results for those commits anymore
-
-        # get commits of this pull request
-        commit_shas = set([commit.sha for commit in pull.get_commits()])
-
-        # get comments of this pull request
-        comments = self.get_pull_request_comments(pull, order_by_updated=False)
-
-        # get all comments that come from this action and are not hidden
-        comments = self.get_action_comments(comments)
-
-        # get comment node ids and their commit sha (possibly abbreviated)
-        matches = [(comment.get('id'), re.search(r'^[Rr]esults for commit ([0-9a-f]{8,40})\.(?:\s.*)?$', comment.get('body'), re.MULTILINE))
-                   for comment in comments]
-        comment_commits = [(node_id, match.group(1))
-                           for node_id, match in matches
-                           if match is not None]
-
-        # get those comment node ids whose commit is not part of this pull request any more
-        comment_ids = [(node_id, comment_commit_sha)
-                       for (node_id, comment_commit_sha) in comment_commits
-                       if not any([sha
-                                   for sha in commit_shas
-                                   if sha.startswith(comment_commit_sha)])]
-
-        # hide all those comments
-        for node_id, comment_commit_sha in comment_ids:
-            logger.info(f'hiding unit test result comment for commit {comment_commit_sha}')
-            self.hide_comment(node_id)
-
-    def hide_all_but_latest_comments(self, pull: PullRequest) -> None:
-        # we want to reduce the number of shown comments to a minimum
-
-        # get comments of this pull request
-        comments = self.get_pull_request_comments(pull, order_by_updated=False)
-
-        # get all comments that come from this action and are not hidden
-        comments = self.get_action_comments(comments)
-
-        # take all but the last comment
-        comment_ids = [comment.get('id') for comment in comments[:-1]]
-
-        # hide all those comments
-        for node_id in comment_ids:
-            logger.info(f'hiding unit test result comment {node_id}')
-            self.hide_comment(node_id)
