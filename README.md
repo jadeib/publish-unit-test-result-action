@@ -689,10 +689,10 @@ environment variable seen by the self-hosted runner.
         }
     fi
 - name: Publish test results
-  uses: jadeib/publish-unit-test-result-action/composite@master
+  uses: EnricoMi/publish-unit-test-result-action/composite@master
   if: always()
   with:
-    files: ${{ env.artifact_path }}/nosetests.xml # Path to test results
+    junit_files: ${{ env.artifact_path }}/tests.xml # Path to test results
 ```
 
 
