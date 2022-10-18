@@ -146,9 +146,9 @@ runs:
       id: test-results
       run: |
         echo '##[group]Publish Unit Test Results'
-        # python3 $GITHUB_ACTION_PATH/../python/publish_unit_test_results.py
+        # python3 $GITHUB_ACTION_PATH/../python/publish_test_results.py
         parentdir="$(dirname "$GITHUB_ACTION_PATH")"
-        python3 $parentdir/python/publish_unit_test_results.py
+        python3 $parentdir/python/publish_test_results.py
         echo '##[endgroup]'
       env:
         GITHUB_TOKEN: ${{ inputs.github_token }}
